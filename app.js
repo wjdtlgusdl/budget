@@ -27,6 +27,9 @@ const ALIASES = {
   '급식보조비': ['식대보조비','급식보조비','정액급식비','식대'],
   '명절휴가비': ['명절휴가비','명절동하계휴가비','명절동하계휴가'],
   '명절동하계휴가비': ['명절휴가비','명절동하계휴가비','명절동하계휴가'],
+  '비정기수당': ['비정기수당','명절휴가비','행사수당'],
+  '관리업무수당': ['관리업무수당'],
+  '직책수당': ['직책수당'],
   '퇴직적립금': ['퇴직적립금','퇴직금적립','퇴직금및퇴직적립금','퇴직연금','퇴직급여']
 };
 
@@ -70,7 +73,7 @@ async function fileToStatementText(file){
     for (let p=1; p<=pdf.numPages; p++) {
       const page = await pdf.getPage(p);
       const content = await page.getTextContent();
-      text += '\n' + content.items.map(i => i.str).join(' ');
+      text += `\n[[PAGE ${p}]]\n` + pdfItemsToLines(content.items).join('\n');
     }
     return text;
   }
@@ -79,6 +82,22 @@ async function fileToStatementText(file){
     return sheets.map(s => `\n[${s.name}]\n` + s.rows.map(r => r.join(' ')).join('\n')).join('\n');
   }
   return await readTextFile(file);
+}
+
+function pdfItemsToLines(items){
+  const rows = [];
+  for (const it of items) {
+    const str = String(it.str || '').trim();
+    if (!str) continue;
+    const tx = it.transform || [1,0,0,1,0,0];
+    const x = tx[4] || 0;
+    const y = Math.round((tx[5] || 0) * 2) / 2;
+    let row = rows.find(r => Math.abs(r.y - y) <= 2);
+    if (!row) { row = {y, items:[]}; rows.push(row); }
+    row.items.push({x, str});
+  }
+  rows.sort((a,b) => b.y - a.y);
+  return rows.map(r => r.items.sort((a,b)=>a.x-b.x).map(i=>i.str).join(' ').replace(/\s+/g,' ').trim()).filter(Boolean);
 }
 
 function cleanHeader(v){
@@ -193,6 +212,7 @@ function aliasesFor(item, group){
   return [...new Set(base)];
 }
 
+
 function buildNormMap(text){
   let compact = '', map = [];
   for (let i=0; i<text.length; i++) {
@@ -201,111 +221,142 @@ function buildNormMap(text){
     compact += ch;
     map.push(i);
   }
-  return { compact: compact.replace(/[0-9]+(?=[^0-9]|$)/g, m => m), map };
+  return { compact, map };
 }
-function amountCandidates(window){
-  const out = [];
-  const afterEquals = [...window.matchAll(/=\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})/g)].map(m => money(m[1])).filter(v => v !== null);
-  afterEquals.forEach(v => out.push({value:v, source:'산출기초'}));
-  const nums = [...window.matchAll(/([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})/g)].map(m => money(m[1])).filter(v => v !== null);
-  nums.forEach(v => out.push({value:v, source:'주변숫자'}));
-  return out;
-}
-function immediateSectionTotal(window){
-  // 목 예산 행: 항목명 283,556 216,000 0 499,556 형태는 단위가 천원입니다.
-  const beforePlan = window.split(/\(본예산\)|발행일|\n/)[0];
-  const nums = [...beforePlan.matchAll(/\b([0-9]{1,3}(?:,[0-9]{3})+|0)\b/g)].map(m => money(m[1])).filter(v => v !== null);
-  if (nums.length >= 4) return nums[3] * 1000;
-  if (nums.length >= 3) return nums[nums.length-1] * 1000;
-  return null;
-}
-
 function lineInfo(statementText){
-  const lines = statementText.split(/\n+/).map(x => x.trim()).filter(Boolean);
-  return lines;
-}
-function lineHasAmountOnly(line){
-  return /^([0-9]{1,3}(?:,[0-9]{3})+|0)(\s+([0-9]{1,3}(?:,[0-9]{3})+|0)){1,5}$/.test(line.trim());
+  return statementText.split(/\n+/).map(x => x.replace(/\s+/g,' ').trim()).filter(Boolean);
 }
 function parseLineAmounts(line){
-  return [...String(line).matchAll(/([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})/g)].map(m => money(m[1])).filter(v => v !== null);
+  return [...String(line).matchAll(/([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,}|0)/g)].map(m => money(m[1])).filter(v => v !== null);
 }
-function looksLikeFormulaLine(line){
-  return /=\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})/.test(line) || /원\s*\*/.test(line);
-}
-function headerTotalFromLines(lines, idx){
-  // 세출예산명세서 목 행은 보통 항목명 다음 줄에 예산액/전년도/증감 숫자가 나오며, 단위는 천원입니다.
-  for (let j=idx; j<Math.min(lines.length, idx+5); j++) {
-    const nums = parseLineAmounts(lines[j]);
-    if (j === idx && nums.length && !lineHasAmountOnly(lines[j])) continue;
-    if (nums.length >= 3) return nums[0] * 1000;
-    if (nums.length === 1 && lineHasAmountOnly(lines[j])) return nums[0] * 1000;
+function parseBudgetRow(line, nextLine='', next2Line=''){
+  const candidates = [line];
+  if (!/[\[\]원*=]|본예산/.test(line)) {
+    candidates.push(`${line} ${nextLine}`.replace(/\s+/g,' '));
+    candidates.push(`${line} ${nextLine} ${next2Line}`.replace(/\s+/g,' '));
+  }
+  for (const raw of candidates) {
+    if (!raw || /\(본예산\)|원\s*\*|=|발행일|예산구분|과\s*목|산출내역|산\s*출\s*기\s*초/.test(raw)) continue;
+    const m = raw.match(/^(.{1,45}?)\s+([0-9]{1,3}(?:,[0-9]{3})+|0)\s+([0-9]{1,3}(?:,[0-9]{3})+|0)\s+([0-9]{1,3}(?:,[0-9]{3})+|0)\s+([0-9]{1,3}(?:,[0-9]{3})+|0)(?:\s|$)/);
+    if (!m) continue;
+    const name = m[1].replace(/\s+/g,' ').trim();
+    if (!name || /단\s*위|보조금|수익자|합계\s*산출/.test(name)) continue;
+    return {
+      name,
+      support: money(m[2]) * 1000,
+      parent: money(m[3]) * 1000,
+      other: money(m[4]) * 1000,
+      total: money(m[5]) * 1000
+    };
   }
   return null;
 }
-function isLikelyHeaderLine(line, term){
-  const nline = norm(line), nt = norm(term);
-  if (!nline.includes(nt)) return false;
-  if (looksLikeFormulaLine(line)) return false;
-  // 산출기초 문장보다 목/세목 제목에 가까운 줄을 우선 사용
-  return nline === nt || nline.startsWith(nt) || lineHasAmountOnly(line.replace(term,''));
+function isMajorOrSubRow(name){
+  const n = norm(name);
+  return ['인건비','교원인건비','직원인건비','그밖의인건비'].includes(n) || n.endsWith('인건비');
 }
-function collectSectionLines(lines, headerIdx){
-  const out = [];
-  const knownTerms = splitKeys(DEFAULTS.salaryKeys + ',' + DEFAULTS.allowanceKeys + ',' + DEFAULTS.retireKeys)
-    .map(norm).filter(Boolean);
-  for (let j=headerIdx+1; j<Math.min(lines.length, headerIdx+28); j++) {
-    const ln = lines[j];
-    const n = norm(ln);
-    // 다음 목/세목 제목처럼 보이면 중단. 단, 산출기초 줄의 항목명은 허용.
-    if (j > headerIdx+2 && knownTerms.some(t => n === t || (n.startsWith(t) && !looksLikeFormulaLine(ln))) && !looksLikeFormulaLine(ln)) break;
-    if (/합계|세입예산|세출예산|페이지|발행일/.test(n) && j > headerIdx+4) break;
-    out.push(ln);
+function groupFromRowName(name, currentGroup){
+  const n = norm(name);
+  if (n.includes('교원인건비')) return '교원';
+  if (n.includes('직원인건비')) return '직원';
+  if (n.includes('그밖의인건비')) return '그밖의';
+  return currentGroup;
+}
+function parseStatementEntries(statementText){
+  const lines = lineInfo(statementText);
+  const entries = [];
+  let currentGroup = '';
+  let currentEntry = null;
+  let inExpense = false;
+  for (let i=0; i<lines.length; i++) {
+    const line = lines[i];
+    if (norm(line).includes('세출예산명세서')) inExpense = true;
+    if (!inExpense) continue;
+    const row = parseBudgetRow(line, lines[i+1] || '', lines[i+2] || '');
+    if (row) {
+      const rowGroup = groupFromRowName(row.name, currentGroup);
+      const n = norm(row.name);
+      if (n === '인건비' || n === '운영비' || n.endsWith('활동비') && !currentGroup) {
+        currentEntry = null;
+      }
+      if (n.includes('교원인건비') || n.includes('직원인건비') || n.includes('그밖의인건비')) {
+        currentGroup = rowGroup;
+        currentEntry = null;
+      } else if (currentGroup && !isMajorOrSubRow(row.name)) {
+        currentEntry = { group: currentGroup, item: row.name, sectionTotal: row.total, support: row.support, parent: row.parent, other: row.other, basisLines: [], startLine: i };
+        entries.push(currentEntry);
+      } else {
+        currentEntry = null;
+      }
+      continue;
+    }
+    if (currentEntry) currentEntry.basisLines.push(line);
   }
-  return out;
+  return entries;
 }
-function basisAmountsFromSection(sectionLines, terms){
+function nearbyBudgetLabel(lines, i){
+  const isLabel = (s) => /\[[^\]]+\].+/.test(s) && !/=/.test(s);
+  for (let j=i+1; j<=Math.min(lines.length-1, i+2); j++) if (isLabel(lines[j])) return lines[j];
+  if (/\[[^\]]+\]/.test(lines[i])) return lines[i];
+  for (let j=i-1; j>=Math.max(0, i-2); j--) if (isLabel(lines[j])) return lines[j];
+  return '';
+}
+function allFormulaAmounts(sectionLines){
+  const amounts = [];
+  for (const line of sectionLines) {
+    [...line.matchAll(/=\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})/g)]
+      .map(m => money(m[1])).filter(v => v !== null).forEach(v => amounts.push(v));
+  }
+  return amounts;
+}
+function basisAmountsFromLines(sectionLines, terms){
   const nterms = terms.map(norm).filter(Boolean);
   const amounts = [];
   for (let i=0; i<sectionLines.length; i++) {
     const line = sectionLines[i];
-    const n = norm(line);
-    const lineAndNext = [line, sectionLines[i+1] || ''].join(' ');
-    const n2 = norm(lineAndNext);
-    if (!nterms.some(t => n.includes(t) || n2.includes(t))) continue;
-    const eqs = [...lineAndNext.matchAll(/=\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})/g)].map(m => money(m[1])).filter(v => v !== null);
-    eqs.forEach(v => amounts.push(v));
+    const eqs = [...line.matchAll(/=\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})/g)].map(m => money(m[1])).filter(v => v !== null);
+    if (!eqs.length) continue;
+    const context = `${line} ${nearbyBudgetLabel(sectionLines, i)}`;
+    const nctx = norm(context);
+    if (nterms.some(t => nctx.includes(t))) eqs.forEach(v => amounts.push(v));
   }
   return amounts;
 }
-function extractStatementEntry(statementText, terms, group){
-  const scopedText = group ? groupSegment(statementText, group) : statementText;
-  const lines = lineInfo(scopedText);
-  const matches = [];
-  for (let i=0; i<lines.length; i++) {
-    for (const term of terms) {
-      if (!norm(term)) continue;
-      if (!norm(lines[i]).includes(norm(term))) continue;
-      const headerLike = isLikelyHeaderLine(lines[i], term);
-      const total = headerLike ? headerTotalFromLines(lines, i) : null;
-      const sectionLines = headerLike ? collectSectionLines(lines, i) : lines.slice(i, Math.min(lines.length, i+8));
-      const basisAmounts = basisAmountsFromSection(sectionLines, terms);
-      const basisTotal = basisAmounts.length ? basisAmounts.reduce((a,b)=>a+b,0) : null;
-      matches.push({term, idx:i, headerLike, total, basisTotal, basisAmounts, evidence:[lines[i],...sectionLines.slice(0,8)].join(' ').slice(0,320)});
-    }
+function entryEvidence(entry, terms){
+  const nterms = terms.map(norm).filter(Boolean);
+  const lines = [];
+  for (let i=0; i<entry.basisLines.length; i++) {
+    const line = entry.basisLines[i];
+    if (!/=/.test(line)) continue;
+    const ctx = `${line} ${nearbyBudgetLabel(entry.basisLines, i)}`;
+    if (nterms.some(t => norm(ctx).includes(t))) lines.push(ctx);
   }
-  if (!matches.length) return {found:false, term:'', sectionTotal:null, basisTotal:null, amount:null, evidence:''};
-  // 1) 같은 목 제목에서 목합계가 있는 항목을 최우선
-  let best = matches.find(m => m.headerLike && m.total !== null) || matches.find(m => m.basisTotal !== null) || matches[0];
-  const amount = best.basisTotal !== null ? best.basisTotal : best.total;
-  return {
-    found:true,
-    term:best.term,
-    sectionTotal:best.total,
-    basisTotal:best.basisTotal,
-    amount,
-    evidence:best.evidence || ''
-  };
+  const head = `${entry.group}인건비 > ${entry.item} 목합계 ${fmt(entry.sectionTotal)}원`;
+  return [head, ...lines.slice(0,4)].join(' / ').slice(0,500);
+}
+function entryMatchesItem(entry, terms, group){
+  if (group && entry.group !== group) return false;
+  const nterms = terms.map(norm).filter(Boolean);
+  const itemName = norm(entry.item);
+  if (nterms.some(t => itemName.includes(t) || t.includes(itemName))) return true;
+  return basisAmountsFromLines(entry.basisLines, terms).length > 0;
+}
+function extractStatementEntry(statementText, terms, group){
+  const entries = parseStatementEntries(statementText);
+  const scoped = entries.filter(e => !group || e.group === group);
+  const direct = scoped.find(e => terms.some(t => norm(e.item).includes(norm(t)) || norm(t).includes(norm(e.item))));
+  if (direct) {
+    const basisAmounts = allFormulaAmounts(direct.basisLines);
+    const basisTotal = basisAmounts.length ? basisAmounts.reduce((a,b)=>a+b,0) : null;
+    return {found:true, term:direct.item, sectionTotal:direct.sectionTotal, basisTotal, amount:direct.sectionTotal ?? basisTotal, evidence:entryEvidence(direct, terms)};
+  }
+  const basisMatches = scoped.map(e => ({entry:e, amounts:basisAmountsFromLines(e.basisLines, terms)})).filter(x => x.amounts.length);
+  if (basisMatches.length) {
+    const e = basisMatches[0].entry;
+    const basisTotal = basisMatches.reduce((sum,x)=>sum+x.amounts.reduce((a,b)=>a+b,0),0);
+    return {found:true, term:e.item, sectionTotal:e.sectionTotal, basisTotal, amount:basisTotal, evidence:entryEvidence(e, terms)};
+  }
+  return {found:false, term:'', sectionTotal:null, basisTotal:null, amount:null, evidence:''};
 }
 function extractStatementAmount(statementText, terms, options={}){
   const entry = extractStatementEntry(statementText, terms, options.group || '');
@@ -388,7 +439,7 @@ function statementOnlyChecks(items, statementText){
   for (const chk of checks) {
     const existsInBudget = items.some(it => it.group === chk.group && chk.terms.some(t => norm(it.item).includes(norm(t)) || norm(it.displayItem).includes(norm(t))));
     if (existsInBudget) continue;
-    const found = extractStatementAmount(groupSegment(statementText, chk.group), chk.terms, {preferSectionTotal:false});
+    const found = extractStatementAmount(statementText, chk.terms, {group: chk.group});
     if (!found.found || found.amount === null) continue;
     // Avoid duplicating one global occurrence twice unless both groups have their own 수당 area; still useful as warning.
     rows.push({
