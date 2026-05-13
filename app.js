@@ -1,32 +1,26 @@
 /* global XLSX, pdfjsLib */
 
 const RULES = {
-  salarySheetKeywords: ["교직원", "보수", "일람", "기준"],
   retirementSheetKeywords: ["퇴직", "적립", "충당"],
-  teacherKeywords: ["원장", "원감", "교사", "담임", "방과후"],
-  regularTeacherKeywords: ["원장", "원감", "교사", "담임"],
-  afterSchoolKeywords: ["방과후"],
-  staffKeywords: ["직원", "사무", "조리", "보조", "기사", "환경", "영양"],
-  allowanceHeaders: ["수당", "급식", "명절", "상여", "휴가", "성과", "자가", "처우", "담임", "직책"],
-  basePayHeaders: ["본봉", "급여", "기본급"],
-  personnelExpenseKeywords: ["인건비", "급여", "수당", "법정부담금", "4대보험", "사학연금", "퇴직", "적립금", "상여금"],
+  personnelExpenseKeywords: ["인건비", "급여", "수당", "퇴직", "적립금", "상여금"],
   allowedPersonnelBuckets: ["교원인건비", "직원인건비", "그밖의인건비"],
-  pdfBudgetItems: {
-    teacherPay: ["교원급여"],
-    afterSchoolTeacherPay: ["방과후교원급여", "방과후급여"],
-    teacherAllowance: ["교원수당"],
-    teacherMealAllowance: ["교원정액급식비", "정액급식비"],
-    staffPay: ["직원급여"],
-    staffAllowance: ["직원수당"],
-    driverPay: ["차량기사급여"],
-    retirement: ["퇴직", "퇴직금", "퇴직적립", "퇴직급여충당"]
+  paymentStopHeaders: ["지급액계", "소득세", "주민세", "본인부담금", "공제액계", "실수령액"],
+  basePayHeaders: ["본봉", "기본급"],
+  allowanceHeaders: ["시간외", "직급보조", "관리업무", "기타수당", "자가운전", "연구활동", "식대", "정액급식", "명절", "스승", "방학", "성과", "상여"],
+  excludedLegalBurdenKeywords: ["법정부담금", "4대보험", "사학연금", "국민연금", "건강보험", "고용보험", "산재보험", "장기요양", "보험료"],
+  directAllowanceAliases: {
+    "식대": ["교원정액급식비", "직원정액급식비", "정액급식비"],
+    "명절휴가비": ["교원명절휴가비", "직원명절휴가비", "명절휴가비"],
+    "스승의날상여금": ["교원스승의날상여금", "직원스승의날상여금", "스승의날상여금"],
+    "방학휴가비": ["교원방학휴가비", "직원방학휴가비", "방학휴가비"],
+    "성과상여금": ["교원성과상여금", "직원성과상여금", "성과상여금"]
   }
 };
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
 const $ = (id) => document.getElementById(id);
-const fmt = (n) => Number.isFinite(n) ? n.toLocaleString("ko-KR") : "-";
+const fmt = (n) => Number.isFinite(n) ? Math.round(n).toLocaleString("ko-KR") : "-";
 const norm = (s) => String(s ?? "").replace(/\s+/g, "").trim();
 const toNumber = (v) => {
   if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -35,6 +29,7 @@ const toNumber = (v) => {
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : 0;
 };
+const approxEqual = (a, b, tolerance = 1000) => Math.abs((a || 0) - (b || 0)) <= tolerance;
 
 $("sampleRulesBtn").addEventListener("click", () => $("rulesDialog").showModal());
 $("closeRulesBtn").addEventListener("click", () => $("rulesDialog").close());
@@ -68,41 +63,66 @@ function setStatus(message, isError = false) {
 
 async function parseExcel(file) {
   const data = await file.arrayBuffer();
-  const wb = XLSX.read(data, { type: "array", cellDates: false, cellFormula: true });
+  const wb = XLSX.read(data, { type: "array", cellDates: false, cellFormula: true, raw: true });
   const sheets = wb.SheetNames.map((name) => {
     const ws = wb.Sheets[name];
-    const matrix = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+    const matrix = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: true });
     return { name, matrix, text: matrix.flat().map(String).join(" ") };
   });
-  const salarySheet = pickSheet(sheets, RULES.salarySheetKeywords) || sheets[0];
+  const salarySheet = pickSalarySheet(sheets);
+  if (!salarySheet) throw new Error("교직원보수일람표 시트를 찾지 못했습니다.");
   const retirementSheets = sheets.filter(s => hasAny(s.name + " " + s.text, RULES.retirementSheetKeywords));
   const salaryRows = inferSalaryRows(salarySheet.matrix);
   return { sheets, salarySheet, salaryRows, retirementSheets };
 }
 
-function pickSheet(sheets, keywords) {
-  return sheets
-    .map(s => ({ sheet: s, score: keywords.reduce((a, k) => a + (norm(s.name).includes(norm(k)) ? 3 : 0) + (norm(s.text).includes(norm(k)) ? 1 : 0), 0) }))
-    .sort((a, b) => b.score - a.score)[0]?.score > 0
-    ? sheets.map(s => ({ sheet: s, score: keywords.reduce((a, k) => a + (norm(s.name).includes(norm(k)) ? 3 : 0) + (norm(s.text).includes(norm(k)) ? 1 : 0), 0) })).sort((a, b) => b.score - a.score)[0].sheet
-    : null;
+function pickSalarySheet(sheets) {
+  return sheets.find(s => norm(s.name).includes("교직원보수일람표"))
+    || sheets.find(s => norm(s.text).includes("교직원보수일람표"))
+    || sheets.find(s => hasAny(s.name, ["교직원", "보수", "일람"]));
 }
 
 function inferSalaryRows(matrix) {
-  const headerRowIndex = matrix.findIndex(row => row.some(c => RULES.basePayHeaders.concat(RULES.allowanceHeaders).some(k => norm(c).includes(norm(k)))));
-  const headers = headerRowIndex >= 0 ? matrix[headerRowIndex].map((h, i) => ({ name: String(h || `열${i + 1}`), index: i })) : [];
-  const amountColumns = headers.filter(h => RULES.basePayHeaders.concat(RULES.allowanceHeaders).some(k => norm(h.name).includes(norm(k))));
+  const headerRowIndex = matrix.findIndex(row => row.some(c => norm(c).includes("본봉")) && row.some(c => norm(c).includes("성명")));
+  if (headerRowIndex < 0) return [];
+
+  const header1 = matrix[headerRowIndex] || [];
+  const header2 = matrix[headerRowIndex + 1] || [];
+  const headers = header1.map((h, i) => cleanHeader([h, header2[i]].filter(Boolean).join(" ")) || `열${i + 1}`);
+
+  const roleCol = headers.findIndex(h => norm(h).includes("직명"));
+  const nameCol = headers.findIndex(h => norm(h).includes("성명"));
+  const baseCol = headers.findIndex(h => hasAny(h, RULES.basePayHeaders));
+  const stopCol = headers.findIndex(h => hasAny(h, RULES.paymentStopHeaders));
+  const lastPayCol = stopCol > 0 ? stopCol - 1 : headers.length - 1;
+
   const rows = [];
-  for (let r = Math.max(0, headerRowIndex + 1); r < matrix.length; r++) {
-    const row = matrix[r];
-    const rowText = row.map(String).join(" ");
-    const hasAmount = amountColumns.some(c => toNumber(row[c.index]) > 0);
-    if (!hasAmount) continue;
+  for (let r = headerRowIndex + 2; r < matrix.length; r++) {
+    const row = matrix[r] || [];
+    const marker = norm(row[0]);
+    if (!marker || marker.includes("작성요령")) continue;
+    if (marker.includes("소계") || marker.includes("합계")) continue;
+    const role = String(row[roleCol] ?? "").trim();
+    const name = String(row[nameCol] ?? "").trim();
+    if (!role || !name) continue;
+    const basePay = toNumber(row[baseCol]);
     const amounts = {};
-    amountColumns.forEach(c => { amounts[c.name] = toNumber(row[c.index]); });
-    rows.push({ rowNumber: r + 1, rowText, amounts });
+    for (let c = 0; c <= lastPayCol; c++) {
+      const value = toNumber(row[c]);
+      if (value > 0) amounts[headers[c]] = (amounts[headers[c]] || 0) + value;
+    }
+    if (basePay <= 0 && Object.keys(amounts).length === 0) continue;
+    rows.push({ rowNumber: r + 1, role, name, rowText: `${role} ${name}`, basePay, amounts, headers });
   }
   return rows;
+}
+
+function cleanHeader(s) {
+  return String(s ?? "")
+    .replace(/\([^)]*\)/g, "")
+    .replace(/[A-Z]=[^\s]+/g, "")
+    .replace(/\s+/g, "")
+    .trim();
 }
 
 async function parsePdf(file) {
@@ -125,95 +145,134 @@ async function parsePdf(file) {
       .filter(Boolean);
     pages.push({ page: i, lines, text: lines.join("\n") });
   }
+  const lines = pages.flatMap(p => p.lines.map(line => ({ page: p.page, line })));
   const fullText = pages.map(p => p.text).join("\n");
-  return { pages, fullText, compactText: norm(fullText) };
+  return { pages, lines, fullText, compactText: norm(fullText), budgetRows: extractBudgetRows(lines), formulaRows: extractFormulaRows(lines) };
+}
+
+function extractBudgetRows(lines) {
+  const rows = [];
+  for (const { page, line } of lines) {
+    const cleaned = line.replace(/\s+/g, " ").trim();
+    const m = cleaned.match(/^(.+?)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)\s+([0-9,]+)$/);
+    if (!m) continue;
+    const label = m[1].trim();
+    if (!/[가-힣]/.test(label) || /예산구분|발행일|보조금|수익자/.test(label)) continue;
+    rows.push({ page, label, compactLabel: norm(label), grant: toNumber(m[2]) * 1000, parent: toNumber(m[3]) * 1000, other: toNumber(m[4]) * 1000, total: toNumber(m[5]) * 1000, raw: line });
+  }
+  return rows;
+}
+
+function extractFormulaRows(lines) {
+  const rows = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].line;
+    const m = line.match(/([0-9,]+)\s*원\s*\*\s*([^=]+?)\s*=\s*([0-9,]+)/);
+    if (!m) continue;
+    const near = [];
+    for (let j = Math.max(0, i - 2); j <= Math.min(lines.length - 1, i + 3); j++) near.push(lines[j].line);
+    const peopleMatches = [...line.matchAll(/\*\s*([0-9]+)\s*명/g)].map(x => Number(x[1]));
+    rows.push({ page: lines[i].page, line, windowText: near.join(" "), compactWindow: norm(near.join(" ")), unit: toNumber(m[1]), total: toNumber(m[3]), people: peopleMatches.length ? Math.max(...peopleMatches) : 0 });
+  }
+  return rows;
 }
 
 function analyze(excel, pdf) {
   const results = [];
   const debug = [];
-  const salaryRows = excel.salaryRows;
+  const groups = buildExcelGroups(excel.salaryRows);
 
   debug.push(`선택된 보수 시트: ${excel.salarySheet?.name || "확인 불가"}`);
-  debug.push(`보수 행 후보: ${salaryRows.length}건`);
+  debug.push(`보수 대상 행: ${excel.salaryRows.length}건`);
   debug.push(`퇴직 관련 시트 후보: ${excel.retirementSheets.map(s => s.name).join(", ") || "없음"}`);
+  debug.push(`PDF 예산 과목 행: ${pdf.budgetRows.length}건 / 산출기초 행: ${pdf.formulaRows.length}건`);
 
-  const groups = buildExcelGroups(salaryRows);
-  const pdfItems = extractPdfItems(pdf.fullText);
-  debug.push(`PDF 산출기초 후보: ${pdfItems.length}건`);
+  comparePay(results, "교원급여", groups.teacherPay, getPdfItemAmount(pdf, ["교원급여"]), getPdfPeople(pdf, ["교원급여"], ["방과후"]), true);
+  comparePay(results, "방과후교원급여", groups.afterSchoolTeacherPay, getPdfFormulaAmount(pdf, ["방과후교원급여", "방과후급여"]), getPdfPeople(pdf, ["방과후교원급여", "방과후급여"]), true);
+  comparePay(results, "직원급여", groups.staffPay, getPdfItemAmount(pdf, ["직원급여"]), getPdfPeople(pdf, ["직원급여"], []), false);
 
-  comparePay(results, "교원급여", groups.teacherPay, findPdfAmount(pdf, RULES.pdfBudgetItems.teacherPay), findPdfPeopleNear(pdf, RULES.pdfBudgetItems.teacherPay), true);
-  comparePay(results, "방과후교원급여", groups.afterSchoolTeacherPay, findPdfAmount(pdf, RULES.pdfBudgetItems.afterSchoolTeacherPay), findPdfPeopleNear(pdf, RULES.pdfBudgetItems.afterSchoolTeacherPay), true);
-  comparePay(results, "직원급여", groups.staffPay, findPdfAmount(pdf, RULES.pdfBudgetItems.staffPay), findPdfPeopleNear(pdf, RULES.pdfBudgetItems.staffPay), false);
-
-  checkAllowances(results, groups.teacherAllowances, pdf, "교원수당");
-  checkAllowances(results, groups.staffAllowances, pdf, "직원수당");
+  checkAllowances(results, groups.teacherAllowances, pdf, "교원수당", "교원");
+  checkAllowances(results, groups.staffAllowances, pdf, "직원수당", "직원");
   checkRetirement(results, excel, pdf);
   checkMisclassifiedPersonnel(results, pdf);
 
-  return { results, debug: debug.concat(buildDebug(groups, pdfItems)) };
+  return { results, debug: debug.concat(buildDebug(groups, pdf)) };
 }
 
 function buildExcelGroups(rows) {
-  const sumByHeaders = (filterFn, headerFn) => {
-    let amount = 0, people = 0;
-    rows.filter(filterFn).forEach(row => {
-      const rowSum = Object.entries(row.amounts).reduce((a, [h, v]) => a + (headerFn(h) ? v : 0), 0);
-      if (rowSum > 0) { amount += rowSum; people++; }
-    });
-    return { amount, people };
-  };
-  const isRegularTeacher = r => hasAny(r.rowText, RULES.regularTeacherKeywords) && !hasAny(r.rowText, ["방과후"]);
-  const isAfterSchool = r => hasAny(r.rowText, RULES.afterSchoolKeywords);
-  const isStaff = r => hasAny(r.rowText, RULES.staffKeywords) && !hasAny(r.rowText, RULES.teacherKeywords);
-  const isBase = h => hasAny(h, RULES.basePayHeaders);
-  const isAllowance = h => hasAny(h, RULES.allowanceHeaders) && !isBase(h);
+  const regularTeachers = rows.filter(r => isTeacher(r.role) && !norm(r.role).includes("방과후"));
+  const afterSchoolTeachers = rows.filter(r => norm(r.role).includes("방과후"));
+  const staff = rows.filter(r => !regularTeachers.includes(r) && !afterSchoolTeachers.includes(r));
+
   return {
-    teacherPay: sumByHeaders(isRegularTeacher, isBase),
-    afterSchoolTeacherPay: sumByHeaders(isAfterSchool, isBase),
-    staffPay: sumByHeaders(isStaff, isBase),
-    teacherAllowances: collectAllowances(rows.filter(isRegularTeacher), isAllowance),
-    staffAllowances: collectAllowances(rows.filter(isStaff), isAllowance)
+    teacherPay: sumBase(regularTeachers),
+    afterSchoolTeacherPay: sumBase(afterSchoolTeachers),
+    staffPay: sumBase(staff),
+    teacherAllowances: collectAllowances(regularTeachers),
+    staffAllowances: collectAllowances(staff),
+    staffRoles: staff.map(r => r.role)
   };
 }
 
-function collectAllowances(rows, headerFn) {
+function isTeacher(role) {
+  const r = norm(role);
+  return r.includes("원장") || r.includes("원감") || r.includes("교사") || r.includes("교원") || r.includes("담임");
+}
+
+function sumBase(rows) {
+  return { amount: rows.reduce((a, r) => a + (r.basePay || 0), 0), people: rows.filter(r => (r.basePay || 0) > 0).length, rows };
+}
+
+function collectAllowances(rows) {
   const map = new Map();
   rows.forEach(row => {
     Object.entries(row.amounts).forEach(([header, value]) => {
-      if (value > 0 && headerFn(header)) map.set(header, (map.get(header) || 0) + value);
+      if (value <= 0) return;
+      if (isLegalBurden(header)) return;
+      if (hasAny(header, RULES.basePayHeaders)) return;
+      if (!hasAny(header, RULES.allowanceHeaders)) return;
+      const label = canonicalAllowanceName(header);
+      map.set(label, (map.get(label) || 0) + value);
     });
   });
-  return [...map.entries()].map(([name, amount]) => ({ name, amount }));
+  return [...map.entries()].map(([name, amount]) => ({ name, amount })).filter(x => x.amount > 0);
 }
 
-function extractPdfItems(text) {
-  const lines = text.split(/\n+/).map(s => s.trim()).filter(Boolean);
-  return lines.filter(line => /원\s*\*/.test(line) || /=\s*[0-9,]+/.test(line));
+function canonicalAllowanceName(header) {
+  const h = norm(header);
+  if (h.includes("시간외")) return "시간외수당";
+  if (h.includes("직급보조")) return "직급보조비";
+  if (h.includes("관리업무")) return "관리업무수당";
+  if (h.includes("기타수당")) return "기타수당";
+  if (h.includes("자가운전")) return "자가운전보조금";
+  if (h.includes("연구활동")) return "연구활동비";
+  if (h.includes("식대") || h.includes("정액급식")) return "식대";
+  if (h.includes("명절")) return "명절휴가비";
+  if (h.includes("스승")) return "스승의날상여금";
+  if (h.includes("방학")) return "방학휴가비";
+  if (h.includes("성과")) return "성과상여금";
+  return header;
 }
 
-function findPdfAmount(pdf, aliases) {
-  for (const alias of aliases) {
-    const idx = pdf.compactText.indexOf(norm(alias));
-    if (idx < 0) continue;
-    const slice = pdf.compactText.slice(idx, idx + 260);
-    const formulaMatch = slice.match(/=([0-9,]+)원?/);
-    if (formulaMatch) return toNumber(formulaMatch[1]);
-    const tableMatch = slice.match(new RegExp(`${norm(alias)}([0-9,]{1,12})`));
-    if (tableMatch) return toNumber(tableMatch[1]) * 1000;
-  }
-  return 0;
+function getPdfItemAmount(pdf, aliases) {
+  const aliasNorms = aliases.map(norm);
+  const row = pdf.budgetRows.find(r => aliasNorms.includes(r.compactLabel));
+  return row ? row.total : 0;
 }
 
-function findPdfPeopleNear(pdf, aliases) {
-  for (const alias of aliases) {
-    const idx = pdf.compactText.indexOf(norm(alias));
-    if (idx < 0) continue;
-    const slice = pdf.compactText.slice(idx, idx + 220);
-    const matches = [...slice.matchAll(/\*([0-9]+)명\*/g)].map(m => Number(m[1]));
-    if (matches.length) return matches.reduce((a, b) => a + b, 0);
-  }
-  return 0;
+function getPdfFormulaAmount(pdf, aliases, excludeAliases = []) {
+  const aliasNorms = aliases.map(norm);
+  const excludeNorms = excludeAliases.map(norm);
+  const rows = pdf.formulaRows.filter(r => aliasNorms.some(a => r.compactWindow.includes(a)) && !excludeNorms.some(e => r.compactWindow.includes(e)));
+  return rows.reduce((a, r) => a + r.total, 0);
+}
+
+function getPdfPeople(pdf, aliases, excludeAliases = []) {
+  const aliasNorms = aliases.map(norm);
+  const excludeNorms = excludeAliases.map(norm);
+  const rows = pdf.formulaRows.filter(r => aliasNorms.some(a => r.compactWindow.includes(a)) && !excludeNorms.some(e => r.compactWindow.includes(e)) && r.people > 0);
+  if (!rows.length) return 0;
+  return Math.max(...rows.map(r => r.people));
 }
 
 function comparePay(results, label, excelGroup, pdfAmount, pdfPeople, checkPeople) {
@@ -222,59 +281,85 @@ function comparePay(results, label, excelGroup, pdfAmount, pdfPeople, checkPeopl
   let status = "ok", message = "금액 일치";
   if (excelGroup.amount === 0 && pdfAmount === 0) {
     status = "warn"; message = "자동 추출 실패 또는 항목 없음";
-  } else if (Math.abs(amountDiff) > 1000) {
+  } else if (!approxEqual(excelGroup.amount, pdfAmount)) {
     status = "bad"; message = `금액 차이 ${fmt(amountDiff)}원`;
   }
   if (checkPeople && pdfPeople > 0 && peopleDiff !== 0) {
     status = "bad";
-    message += ` / 인원수 불일치: PDF ${pdfPeople}명, 엑셀 ${excelGroup.people}명`;
+    message += `${message ? " / " : ""}인원수 불일치: PDF ${pdfPeople}명, 엑셀 ${excelGroup.people}명`;
   }
   results.push({ category: "보수", item: label, excelAmount: excelGroup.amount, pdfAmount, excelPeople: excelGroup.people, pdfPeople, status, message });
 }
 
-function checkAllowances(results, allowances, pdf, bucketName) {
+function checkAllowances(results, allowances, pdf, bucketName, prefix) {
   const missing = [];
   const direct = [];
   allowances.forEach(a => {
-    const amount = findPdfAmount(pdf, [a.name]);
-    if (amount > 0 && Math.abs(amount - a.amount) <= 1000) direct.push({ ...a, pdfAmount: amount });
+    const aliases = allowanceAliasesFor(a.name, prefix);
+    const amount = getPdfFormulaAmount(pdf, aliases);
+    if (amount > 0 && approxEqual(amount, a.amount)) direct.push({ ...a, pdfAmount: amount });
     else missing.push(a);
   });
-  direct.forEach(a => results.push({ category: "수당", item: a.name, excelAmount: a.amount, pdfAmount: a.pdfAmount, status: "ok", message: "개별 편성 일치" }));
+
+  direct.forEach(a => results.push({ category: "수당", item: `${prefix} ${a.name}`, excelAmount: a.amount, pdfAmount: a.pdfAmount, status: "ok", message: "개별 편성 일치" }));
 
   const missingSum = missing.reduce((a, b) => a + b.amount, 0);
   if (missing.length === 0) return;
-  const bucketAmount = findPdfAmount(pdf, [bucketName]);
-  if (bucketAmount && Math.abs(bucketAmount - missingSum) <= 1000) {
+  const bucketAmount = getPdfFormulaAmount(pdf, [bucketName]);
+  if (bucketAmount && approxEqual(bucketAmount, missingSum)) {
     results.push({ category: "수당", item: bucketName, excelAmount: missingSum, pdfAmount: bucketAmount, status: "info", message: `통합편성(${missing.map(x => `${x.name} ${fmt(x.amount)}원`).join(" + ")} = ${fmt(missingSum)}원)` });
   } else {
-    results.push({ category: "수당", item: bucketName, excelAmount: missingSum, pdfAmount: bucketAmount, status: "warn", message: `추가확인필요: PDF에서 개별 확인되지 않은 수당 ${missing.length}건의 합계와 ${bucketName} 금액이 일치하지 않습니다.` });
+    results.push({ category: "수당", item: bucketName, excelAmount: missingSum, pdfAmount: bucketAmount, status: "warn", message: `추가확인필요: PDF에서 개별 확인되지 않은 수당 ${missing.length}건의 합계와 ${bucketName} 산출기초 금액이 일치하지 않습니다.` });
   }
+}
+
+function allowanceAliasesFor(name, prefix) {
+  const base = RULES.directAllowanceAliases[name] || [name];
+  return Array.from(new Set(base.flatMap(x => [x, `${prefix}${x}`, `${prefix}${name}`])));
 }
 
 function checkRetirement(results, excel, pdf) {
   const hasRetirementAmount = excel.retirementSheets.some(s => s.matrix.flat().some(c => toNumber(c) > 0));
   if (!hasRetirementAmount) return;
-  const found = hasAny(pdf.fullText, RULES.pdfBudgetItems.retirement);
+  const found = hasAny(pdf.fullText, ["퇴직", "퇴직금", "퇴직적립", "퇴직급여충당"]);
   results.push({ category: "퇴직금", item: "퇴직적립금 편성 여부", status: found ? "ok" : "bad", message: found ? "퇴직 관련 편성 항목 확인" : "퇴직금 적립금 미편성 의심", excelAmount: null, pdfAmount: null });
 }
 
 function checkMisclassifiedPersonnel(results, pdf) {
-  const lines = pdf.fullText.split(/\n+/).map(s => s.trim()).filter(Boolean);
-  let currentBucket = "";
   const suspicious = [];
-  for (const line of lines) {
-    if (/인건비|급식비|통학차량|교육활동|운영비|시설비|적립금/.test(line) && !/=/.test(line)) currentBucket = line;
-    const isPersonnel = hasAny(line, RULES.personnelExpenseKeywords) || /기사급여|영양사|조리.*급여/.test(line);
-    const allowed = hasAny(currentBucket, RULES.allowedPersonnelBuckets);
-    if (isPersonnel && currentBucket && !allowed && !/세출합계|발행일/.test(line)) {
-      const location = currentBucket.replace(/\s+/g, " ");
-      const item = line.replace(/\s+/g, " ");
-      suspicious.push({ item, location });
+  const importantNonPersonnelBuckets = ["일반급식비간식비", "통학차량이용비", "특별급식비간식비", "방과후교육활동비", "시설비", "수용비"];
+  let currentBudgetRow = "";
+
+  for (let i = 0; i < pdf.lines.length; i++) {
+    const line = pdf.lines[i].line;
+    const budget = pdf.budgetRows.find(r => r.raw === line);
+    if (budget) currentBudgetRow = budget.label;
+
+    const window = pdf.lines.slice(Math.max(0, i - 2), Math.min(pdf.lines.length, i + 4)).map(x => x.line).join(" ");
+    const nWindow = norm(window);
+    if (isLegalBurden(nWindow)) continue;
+    const isPersonnel = hasAny(nWindow, RULES.personnelExpenseKeywords) || /기사급여|영양사|조리.*급여/.test(nWindow);
+    const allowed = hasAny(currentBudgetRow, RULES.allowedPersonnelBuckets);
+    const inWrongBucket = hasAny(currentBudgetRow, importantNonPersonnelBuckets) || (!allowed && currentBudgetRow && !/인건비/.test(currentBudgetRow));
+    if (isPersonnel && inWrongBucket && !/세출합계|발행일|예산구분/.test(line)) {
+      const item = extractPersonnelLabel(window);
+      if (item) suspicious.push({ item, location: currentBudgetRow });
     }
   }
+
   const unique = Array.from(new Map(suspicious.map(x => [`${x.item}-${x.location}`, x])).values()).slice(0, 20);
   unique.forEach(x => results.push({ category: "오편성", item: x.item, status: "bad", message: `${x.item}를 ${x.location}에 편성`, excelAmount: null, pdfAmount: null }));
+}
+
+function extractPersonnelLabel(text) {
+  const compact = norm(text);
+  if (isLegalBurden(text)) return "";
+  const candidates = ["영양사인건비", "영양사급여", "차량기사급여", "조리직원급여", "조리원급여", "교원급여", "직원급여", "인건비", "수당"];
+  return candidates.find(c => compact.includes(norm(c))) || "인건비성 항목";
+}
+
+function isLegalBurden(text) {
+  return hasAny(text, RULES.excludedLegalBurdenKeywords);
 }
 
 function hasAny(text, keywords) {
@@ -282,7 +367,7 @@ function hasAny(text, keywords) {
   return keywords.some(k => n.includes(norm(k)));
 }
 
-function buildDebug(groups, pdfItems) {
+function buildDebug(groups, pdf) {
   return [
     "\n[엑셀 자동 집계]",
     `교원급여: ${fmt(groups.teacherPay.amount)}원 / ${groups.teacherPay.people}명`,
@@ -290,8 +375,10 @@ function buildDebug(groups, pdfItems) {
     `직원급여: ${fmt(groups.staffPay.amount)}원 / ${groups.staffPay.people}명`,
     `교원수당 후보: ${groups.teacherAllowances.map(a => `${a.name}=${fmt(a.amount)}`).join(", ") || "없음"}`,
     `직원수당 후보: ${groups.staffAllowances.map(a => `${a.name}=${fmt(a.amount)}`).join(", ") || "없음"}`,
-    "\n[PDF 산출기초 후보 일부]",
-    pdfItems.slice(0, 40).join("\n")
+    "\n[PDF 예산 과목 일부]",
+    pdf.budgetRows.slice(0, 35).map(r => `${r.label}: ${fmt(r.total)}원`).join("\n"),
+    "\n[PDF 산출기초 일부]",
+    pdf.formulaRows.slice(0, 45).map(r => `${r.line} / 근처: ${r.windowText}`).join("\n")
   ];
 }
 
