@@ -4,14 +4,19 @@ export async function parseWorkbook(file) {
 }
 
 export function buildExcelFacts(workbook) {
-  const sheets = workbook.SheetNames.map((name) => ({
-    name,
-    rows: XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: '', raw: true })
-  }));
+  const visibilityByName = getSheetVisibility(workbook);
+  const sheets = workbook.SheetNames
+    .filter((name) => visibilityByName[name] === 'visible')
+    .map((name) => ({
+      name,
+      rows: XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: '', raw: true })
+    }));
+  const excludedSheets = workbook.SheetNames.filter((name) => visibilityByName[name] !== 'visible');
   const allRows = sheets.flatMap((sheet) => sheet.rows.map((row, idx) => ({ sheet: sheet.name, row, rowNumber: idx + 1 })));
   const diagnostics = [];
   const facts = {
-    sheetNames: workbook.SheetNames,
+    sheetNames: sheets.map((s) => s.name),
+    excludedSheets,
     sheets,
     budgetPages: buildBudgetPages(sheets),
     salaryItems: [],
@@ -25,12 +30,27 @@ export function buildExcelFacts(workbook) {
   const heuristic = detectSalaryItems(allRows);
   facts.salaryItems = dedupeItems([...structured, ...monthly, ...heuristic]);
 
+  if (excludedSheets.length) {
+    facts.diagnostics.push(`숨김 시트 ${excludedSheets.length}개는 검토 근거에서 제외했습니다: ${excludedSheets.join(', ')}`);
+  }
+
   if (!facts.salaryItems.length) {
-    facts.diagnostics.push('검토 항목을 추출하지 못했습니다. 단, 이번 버전은 교직원보수일람표와 월급여 시트를 모두 확인했습니다. 디버그 정보의 시트명/헤더행/소계행을 확인해주세요.');
+    facts.diagnostics.push('검토 항목을 추출하지 못했습니다. 이번 버전은 보이는 시트만 사용합니다. 교직원보수일람표 시트의 헤더행/소계행을 확인해주세요.');
   } else {
     facts.diagnostics.push(`검토 대상 ${facts.salaryItems.length}건을 추출했습니다.`);
   }
   return facts;
+}
+
+function getSheetVisibility(workbook) {
+  const meta = workbook?.Workbook?.Sheets || [];
+  const map = {};
+  workbook.SheetNames.forEach((name, index) => {
+    const hidden = Number(meta[index]?.Hidden || 0);
+    // SheetJS: 0=visible, 1=hidden, 2=very hidden
+    map[name] = hidden === 0 ? 'visible' : 'hidden';
+  });
+  return map;
 }
 
 function detectFromPayrollSheet(sheets, diagnostics = []) {
@@ -145,6 +165,8 @@ function detectPayrollColumns(header) {
 }
 
 function buildBudgetPages(sheets) {
+  // 숨김 시트의 세출예산명세서는 검토 근거로 사용하지 않습니다.
+  // PDF에서 추출된 텍스트가 우선이며, 보이는 세출예산명세서 시트가 있을 때만 보조 근거로 사용합니다.
   const budget = sheets.find((s) => /세출예산명세서/.test(s.name));
   if (!budget) return [];
   return budget.rows.map((row, idx) => ({ page: `엑셀:${budget.name} ${idx + 1}행`, text: rowText(row) })).filter((p) => p.text.trim());
