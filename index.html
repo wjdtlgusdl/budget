@@ -3,61 +3,74 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>예산서 자동 검토 도구</title>
+  <title>세출예산명세서 검토 도구</title>
   <link rel="stylesheet" href="./styles.css" />
   <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.7.76/pdf.min.mjs" type="module"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.mjs" type="module"></script>
 </head>
 <body>
-  <main class="container">
-    <section class="hero">
-      <p class="eyebrow">교직원 보수 일람표 × 세출예산명세서</p>
-      <h1>예산 편성 적정성 자동 검토</h1>
-      <p class="lead">엑셀 보수자료와 PDF 세출예산명세서를 비교해 적정, 과소편성, 과다편성, 미편성, 통합편성 의심, 타 목 편성 여부를 점검합니다.</p>
-      <div class="notice">
-        <strong>보안 안내</strong>
-        <span>파일은 서버로 전송하지 않고 현재 브라우저에서만 처리합니다. 주민번호, 계좌번호 등 민감정보는 제거 후 사용하세요.</span>
-      </div>
-    </section>
+  <header class="hero">
+    <div>
+      <p class="eyebrow">무료 공개용 정적웹앱 · 브라우저 내 분석</p>
+      <h1>예산서 보수 일람표 ↔ 세출예산명세서 검토</h1>
+      <p class="lead">엑셀의 교직원 보수 자료와 PDF 세출예산명세서를 비교해 일치, 과소·과다편성, 미편성, 통합 편성 의심, 분리 편성 여부를 표시합니다.</p>
+    </div>
+  </header>
 
-    <section class="card grid">
-      <label class="file-box">
-        <span>1. 교직원 보수 일람표 엑셀</span>
-        <input id="excelFile" type="file" accept=".xlsx,.xls,.csv" />
+  <main>
+    <section class="card grid two">
+      <label class="filebox">
+        <span>① 엑셀 예산서 업로드</span>
+        <input id="excelFile" type="file" accept=".xlsx,.xls,.xlsm" />
+        <small>숨겨진 시트는 분석에서 제외됩니다.</small>
       </label>
-      <label class="file-box">
-        <span>2. 세출예산명세서 PDF</span>
-        <input id="pdfFile" type="file" accept="application/pdf,.pdf" />
+      <label class="filebox">
+        <span>② PDF 세출예산명세서 업로드</span>
+        <input id="pdfFile" type="file" accept=".pdf" />
+        <small>예상 목에서 못 찾으면 PDF 전체를 검색합니다.</small>
       </label>
     </section>
 
-    <section class="card options">
-      <h2>검토 옵션</h2>
-      <label><input type="checkbox" id="allowTruncation" checked /> PDF 천원 단위 금액을 원 단위로 환산하여 비교</label>
-      <label><input type="checkbox" id="searchWholePdf" checked /> 인건비 목에 없으면 PDF 전체에서 타 목 편성 여부 검색</label>
-      <label><input type="checkbox" id="retirementPresenceOnly" checked /> 퇴직적립금은 금액 비교 없이 편성 여부만 확인</label>
-      <button id="runBtn">검토 시작</button>
+    <section class="card actions">
+      <button id="analyzeBtn">검토 실행</button>
+      <button id="downloadCsvBtn" disabled>CSV 다운로드</button>
+      <button id="downloadJsonBtn" disabled>JSON 다운로드</button>
+      <button id="resetBtn" class="secondary">초기화</button>
+      <p id="status" role="status">파일을 업로드한 뒤 검토를 실행하세요.</p>
     </section>
 
-    <section class="card" id="summary" hidden></section>
+    <section class="card">
+      <h2>검토 기준</h2>
+      <ul class="rules">
+        <li>PDF 예산액이 천원 단위인 경우 엑셀 원 단위 금액을 천원 단위로 절사해 비교합니다.</li>
+        <li>숨김/매우 숨김 엑셀 시트는 활용하지 않습니다.</li>
+        <li>퇴직금 관련 시트에 적립금액이 있으면 PDF 편성 여부만 확인하며 금액은 비교하지 않습니다.</li>
+        <li>예상 목에서 항목을 못 찾으면 PDF 전체 검색 후 발견 위치를 표시합니다.</li>
+        <li>동일 항목의 산출기초가 여러 개이고 합계와 인원수가 맞으면 “분리 편성 되어 있음”으로 표시합니다.</li>
+        <li>수당이 개별 항목이 아닌 교원수당/직원수당 등으로 묶이면 “통합 편성 의심”으로 표시합니다.</li>
+      </ul>
+    </section>
+
+    <section class="card" id="summaryCard" hidden>
+      <h2>요약</h2>
+      <div id="summary" class="summary"></div>
+    </section>
 
     <section class="card" id="resultsCard" hidden>
-      <div class="table-actions">
-        <h2>검토 결과</h2>
-        <button id="downloadCsvBtn" class="secondary">CSV 다운로드</button>
-      </div>
+      <h2>검토 결과</h2>
       <div class="table-wrap">
         <table id="resultsTable">
           <thead>
             <tr>
-              <th>대분류</th>
+              <th>그룹</th>
               <th>항목</th>
-              <th>엑셀금액</th>
-              <th>PDF금액</th>
+              <th>엑셀 기준</th>
+              <th>PDF 확인</th>
               <th>차이</th>
-              <th>판정</th>
-              <th>상세사유</th>
-              <th>PDF 위치/근거</th>
+              <th>금액검증</th>
+              <th>편성형태</th>
+              <th>최종판정</th>
+              <th>비고</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -65,17 +78,18 @@
       </div>
     </section>
 
-    <section class="card help">
-      <h2>현재 반영된 주요 규칙</h2>
-      <ul>
-        <li>엑셀 원 단위 금액과 PDF 천원 단위 금액을 환산 비교합니다.</li>
-        <li>금액이 다르면 차이를 원 단위로 표시하고 과소/과다편성을 판정합니다.</li>
-        <li>퇴직적립금 시트에 적립금액이 있으면 PDF 편성 존재 여부만 확인합니다.</li>
-        <li>인건비가 정상 목에 없으면 PDF 전체에서 급식비 등 타 목 편성 여부를 탐색합니다.</li>
-        <li>수당이 개별 항목이 아니라 교원수당/직원수당으로 묶인 경우 통합편성 의심으로 표시합니다.</li>
-      </ul>
+    <section class="card" id="debugCard" hidden>
+      <details>
+        <summary>추출 원자료 확인</summary>
+        <pre id="debugOutput"></pre>
+      </details>
     </section>
   </main>
-  <script type="module" src="./src/app.js"></script>
+
+  <footer>
+    <p>모든 파일은 브라우저 안에서만 처리됩니다. GitHub Pages 또는 Cloudflare Pages에 정적 파일 그대로 배포할 수 있습니다.</p>
+  </footer>
+
+  <script src="./app.js" type="module"></script>
 </body>
 </html>
