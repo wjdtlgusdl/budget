@@ -255,13 +255,23 @@ function bundleFound(statementText, group, cfg){
 }
 function compareItems(items, statementText, cfg){
   const rows = items.map(it => {
-    const preferSectionTotal = /교원급여|직원급여|퇴직/.test(norm(it.item));
+    const isRetirement = it.category === '퇴직적립금';
+    const preferSectionTotal = /교원급여|직원급여/.test(norm(it.item));
     const found = extractStatementAmount(statementText, it.matchTerms || aliasesFor(it.item,it.group), {preferSectionTotal});
-    const statementAmount = found.found ? found.amount : null;
-    const diff = statementAmount === null ? null : it.amount - statementAmount;
+    const statementAmount = (!isRetirement && found.found) ? found.amount : null;
+    const diff = (!isRetirement && statementAmount !== null) ? it.amount - statementAmount : null;
     const hasBundle = it.category === '수당' && bundleFound(statementText, it.group, cfg);
     let status, memo;
-    if (found.found && statementAmount !== null && diff === 0) { status = '일치'; memo = '항목 및 금액 일치'; }
+
+    if (isRetirement) {
+      if (found.found) {
+        status = '항목 있음';
+        memo = '퇴직적립금은 금액 비교 제외 대상입니다. 세출예산명세서에 퇴직적립금 관련 항목 존재 여부만 확인했습니다.';
+      } else {
+        status = '명세서 항목 없음';
+        memo = '엑셀의 퇴직적립금/퇴직금적립 관련 시트에 금액이 있으나 세출예산명세서에서 퇴직적립금 관련 항목을 찾지 못했습니다.';
+      }
+    } else if (found.found && statementAmount !== null && diff === 0) { status = '일치'; memo = '항목 및 금액 일치'; }
     else if (found.found && statementAmount !== null && diff > 0) { status = '과소편성'; memo = `세출예산명세서가 ${fmt(Math.abs(diff))}원 적게 편성되어 있습니다.`; }
     else if (found.found && statementAmount !== null && diff < 0) { status = '과다편성'; memo = `세출예산명세서가 ${fmt(Math.abs(diff))}원 많이 편성되어 있습니다.`; }
     else if (!found.found && hasBundle) { status = '개별 미편성'; memo = `${it.displayItem || it.item} 개별 산출내역은 없고 ${it.group}수당 등 통합 편성 가능성이 있습니다.`; }
@@ -336,9 +346,9 @@ function statementOnlyChecks(items, statementText){
 function renderSummary(rows){
   const el = $('summary');
   const total = rows.length;
-  const issues = rows.filter(r => r.판정 !== '일치').length;
+  const issues = rows.filter(r => !['일치','항목 있음'].includes(r.판정)).length;
   const diff = rows.filter(r => /과소편성|과다편성|금액/.test(r.판정)).length;
-  const missing = rows.filter(r => /미편성|내역 없음|미반영/.test(r.판정)).length;
+  const missing = rows.filter(r => /미편성|내역 없음|미반영|항목 없음/.test(r.판정)).length;
   el.hidden = false;
   el.innerHTML = [
     ['전체 검토', total], ['문제 항목', issues], ['금액 차이', diff], ['미편성/누락', missing]
@@ -346,7 +356,7 @@ function renderSummary(rows){
 }
 
 function renderTable(){
-  const rows = showingOnlyIssues ? resultRows.filter(r => r.판정 !== '일치') : resultRows;
+  const rows = showingOnlyIssues ? resultRows.filter(r => !['일치','항목 있음'].includes(r.판정)) : resultRows;
   const headers = ['구분','검토분류','예산서항목','비교기준항목','예산서금액','명세서대응항목','명세서금액','차액','판정','검토메모','예산서시트','예산서행'];
   const table = $('resultTable');
   table.innerHTML = '<thead><tr>' + headers.map(h=>`<th>${h}</th>`).join('') + '</tr></thead><tbody>' +
