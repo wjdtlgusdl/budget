@@ -3,76 +3,79 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>인건비 예산 대조 도구</title>
-  <link rel="stylesheet" href="styles.css" />
+  <title>예산서 자동 검토 도구</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.7.76/pdf.min.mjs" type="module"></script>
 </head>
 <body>
-  <main class="wrap">
-    <header class="hero">
-      <div>
-        <p class="eyebrow">교직원보수일람표 ↔ 세출예산명세서</p>
-        <h1>인건비 예산 대조 도구</h1>
-        <p class="sub">엑셀 예산서와 세출예산명세서를 업로드하면 교원/직원 인건비, 수당 개별 편성 여부, 퇴직적립금 누락 여부, 금액 차이를 자동으로 점검합니다.</p>
+  <main class="container">
+    <section class="hero">
+      <p class="eyebrow">교직원 보수 일람표 × 세출예산명세서</p>
+      <h1>예산 편성 적정성 자동 검토</h1>
+      <p class="lead">엑셀 보수자료와 PDF 세출예산명세서를 비교해 적정, 과소편성, 과다편성, 미편성, 통합편성 의심, 타 목 편성 여부를 점검합니다.</p>
+      <div class="notice">
+        <strong>보안 안내</strong>
+        <span>파일은 서버로 전송하지 않고 현재 브라우저에서만 처리합니다. 주민번호, 계좌번호 등 민감정보는 제거 후 사용하세요.</span>
       </div>
-    </header>
+    </section>
 
-    <section class="card grid2">
-      <label class="filebox">
-        <span>① 예산서 엑셀 파일(.xlsx)</span>
-        <input id="budgetFile" type="file" accept=".xlsx,.xls" />
+    <section class="card grid">
+      <label class="file-box">
+        <span>1. 교직원 보수 일람표 엑셀</span>
+        <input id="excelFile" type="file" accept=".xlsx,.xls,.csv" />
       </label>
-      <label class="filebox">
-        <span>② 세출예산명세서(.pdf/.xlsx/.csv/.txt)</span>
-        <input id="statementFile" type="file" accept=".pdf,.xlsx,.xls,.csv,.txt" />
+      <label class="file-box">
+        <span>2. 세출예산명세서 PDF</span>
+        <input id="pdfFile" type="file" accept="application/pdf,.pdf" />
       </label>
     </section>
 
-    <section class="card">
-      <div class="section-title">
-        <h2>검토 설정</h2>
-        <button id="resetConfig" class="ghost">기본값 복원</button>
-      </div>
-      <div class="settings">
-        <label>교원 구분 키워드<input id="teacherKeys" /></label>
-        <label>직원 구분 키워드<input id="staffKeys" /></label>
-        <label>수당 항목 키워드<input id="allowanceKeys" /></label>
-        <label>급여 항목 키워드<input id="salaryKeys" /></label>
-        <label>퇴직적립금 시트/항목 키워드<input id="retireKeys" /></label>
-        <label>통합 수당 편성명<input id="bundleKeys" /></label>
-      </div>
-      <p class="hint">쉼표로 구분합니다. 기관별 항목명이 다르면 키워드를 추가하세요.</p>
-      <button id="runBtn" class="primary">대조 실행</button>
+    <section class="card options">
+      <h2>검토 옵션</h2>
+      <label><input type="checkbox" id="allowTruncation" checked /> PDF 천원 단위 금액을 원 단위로 환산하여 비교</label>
+      <label><input type="checkbox" id="searchWholePdf" checked /> 인건비 목에 없으면 PDF 전체에서 타 목 편성 여부 검색</label>
+      <label><input type="checkbox" id="retirementPresenceOnly" checked /> 퇴직적립금은 금액 비교 없이 편성 여부만 확인</label>
+      <button id="runBtn">검토 시작</button>
     </section>
 
-    <section class="summary" id="summary" hidden></section>
+    <section class="card" id="summary" hidden></section>
 
-    <section class="card" id="resultCard" hidden>
-      <div class="section-title">
-        <h2>대조 결과</h2>
-        <div class="actions">
-          <button id="onlyIssue" class="ghost">문제 항목만 보기</button>
-          <button id="downloadXlsx" class="primary small">결과 엑셀 다운로드</button>
-        </div>
+    <section class="card" id="resultsCard" hidden>
+      <div class="table-actions">
+        <h2>검토 결과</h2>
+        <button id="downloadCsvBtn" class="secondary">CSV 다운로드</button>
       </div>
       <div class="table-wrap">
-        <table id="resultTable"></table>
+        <table id="resultsTable">
+          <thead>
+            <tr>
+              <th>대분류</th>
+              <th>항목</th>
+              <th>엑셀금액</th>
+              <th>PDF금액</th>
+              <th>차이</th>
+              <th>판정</th>
+              <th>상세사유</th>
+              <th>PDF 위치/근거</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
     </section>
 
-    <section class="card muted">
-      <h2>판정 기준</h2>
+    <section class="card help">
+      <h2>현재 반영된 주요 규칙</h2>
       <ul>
-        <li><b>일치</b>: 동일 항목이 세출예산명세서에서 확인되고 금액 차이가 0원인 경우</li>
-        <li><b>금액 불일치</b>: 동일 항목이 확인되지만 금액 차이가 있는 경우. 차액은 “예산서 금액 - 명세서 금액”입니다.</li>
-        <li><b>개별 미편성/통합편성 의심</b>: 연구수당·시간외수당 등은 예산서에 있으나 명세서에는 개별 항목이 없고 교원수당/직원수당 같은 통합 항목만 있는 경우</li>
-        <li><b>명세서 내역 없음</b>: 퇴직적립금 등 예산서에는 금액이 있으나 명세서에서 대응 내역을 찾지 못한 경우</li>
+        <li>엑셀 원 단위 금액과 PDF 천원 단위 금액을 환산 비교합니다.</li>
+        <li>금액이 다르면 차이를 원 단위로 표시하고 과소/과다편성을 판정합니다.</li>
+        <li>퇴직적립금 시트에 적립금액이 있으면 PDF 편성 존재 여부만 확인합니다.</li>
+        <li>인건비가 정상 목에 없으면 PDF 전체에서 급식비 등 타 목 편성 여부를 탐색합니다.</li>
+        <li>수당이 개별 항목이 아니라 교원수당/직원수당으로 묶인 경우 통합편성 의심으로 표시합니다.</li>
       </ul>
-      <p class="hint">파일은 브라우저 안에서만 처리됩니다. 별도 서버로 업로드하지 않습니다.</p>
     </section>
   </main>
-
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs" type="module"></script>
-  <script src="app.js" type="module"></script>
+  <script type="module" src="./src/app.js"></script>
 </body>
 </html>
