@@ -1,6 +1,3 @@
-import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.mjs";
-pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
-
 const $ = (id) => document.getElementById(id);
 const state = { rows: [], debug: null };
 
@@ -29,10 +26,29 @@ const CONFIG = {
   ]
 };
 
-$("analyzeBtn").addEventListener("click", analyze);
-$("downloadCsvBtn").addEventListener("click", downloadCsv);
-$("downloadJsonBtn").addEventListener("click", downloadJson);
-$("resetBtn").addEventListener("click", () => location.reload());
+document.addEventListener("DOMContentLoaded", init);
+
+function init() {
+  try {
+    if (window.pdfjsLib) {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js";
+    }
+    const analyzeBtn = $("analyzeBtn");
+    if (!analyzeBtn) throw new Error("실행 버튼을 찾지 못했습니다. index.html과 app.js가 같은 폴더에 있는지 확인하세요.");
+    analyzeBtn.addEventListener("click", analyze);
+    $("downloadCsvBtn").addEventListener("click", downloadCsv);
+    $("downloadJsonBtn").addEventListener("click", downloadJson);
+    $("resetBtn").addEventListener("click", () => location.reload());
+    setStatus("파일을 업로드한 뒤 검토를 실행하세요.");
+  } catch (err) {
+    const el = document.getElementById("status");
+    if (el) {
+      el.textContent = `초기화 오류: ${err.message}`;
+      el.style.color = "#b91c1c";
+    }
+    console.error(err);
+  }
+}
 
 async function analyze() {
   const excelFile = $("excelFile").files[0];
@@ -183,7 +199,8 @@ function aggregatePeople(peopleRows) {
 
 async function parsePdf(file) {
   const data = new Uint8Array(await file.arrayBuffer());
-  const pdf = await pdfjsLib.getDocument({ data }).promise;
+  if (!window.pdfjsLib) throw new Error("PDF.js 라이브러리를 불러오지 못했습니다. 인터넷 연결 또는 CDN 차단 여부를 확인하세요.");
+  const pdf = await window.pdfjsLib.getDocument({ data }).promise;
   const pages = [];
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
