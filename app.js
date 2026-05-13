@@ -65,13 +65,26 @@ function setStatus(message, isError = false) {
 async function parseExcel(file) {
   const data = await file.arrayBuffer();
   const wb = XLSX.read(data, { type: "array", cellDates: false, cellFormula: false, raw: true, blankrows: false });
-  const sheets = wb.SheetNames.map((name) => {
+  const visibilityMeta = (wb.Workbook && Array.isArray(wb.Workbook.Sheets)) ? wb.Workbook.Sheets : [];
+  const sheets = wb.SheetNames.map((name, index) => {
     const ws = wb.Sheets[name];
     const matrix = worksheetToMatrix(ws);
-    return { name, matrix, text: matrix.flat().map(String).join(" ") };
+    const hidden = Number(visibilityMeta[index]?.Hidden || 0);
+    return {
+      name,
+      matrix,
+      text: matrix.flat().map(String).join(" "),
+      available: !!ws,
+      ref: ws?.["!ref"] || "",
+      hidden,
+      visible: hidden === 0
+    };
   });
   const salarySheet = pickSalarySheet(sheets);
-  if (!salarySheet) throw new Error("교직원보수일람표 시트를 찾지 못했습니다.");
+  if (!salarySheet) {
+    const names = sheets.map(s => `${s.name}${s.visible === false ? "(숨김)" : ""}${s.available ? "" : "(읽기불가)"}`).join(", ");
+    throw new Error(`보수기준/교직원보수일람표 시트를 찾지 못했습니다. 인식된 시트: ${names}`);
+  }
   const retirementSheets = sheets.filter(s => norm(s.name + " " + s.text).includes("퇴직"));
   const salaryData = inferSalaryData(salarySheet.matrix);
   // v7: 사용자 기준에 따라 엑셀은 보수기준 시트와 퇴직 관련 시트만 활용한다.
@@ -81,8 +94,8 @@ async function parseExcel(file) {
 
 
 function worksheetToMatrix(ws) {
+  if (!ws || !ws["!ref"]) return [];
   const ref = ws["!ref"];
-  if (!ref) return [];
   const range = XLSX.utils.decode_range(ref);
   const matrix = [];
   for (let r = range.s.r; r <= range.e.r; r++) {
@@ -103,9 +116,38 @@ function worksheetToMatrix(ws) {
 }
 
 function pickSalarySheet(sheets) {
-  return sheets.find(s => norm(s.name).includes("교직원보수일람표"))
-    || sheets.find(s => norm(s.text).includes("교직원보수일람표"))
-    || sheets.find(s => hasAny(s.name, ["교직원", "보수", "일람"]));
+  // v9: 정확한 시트명이 아니어도 된다.
+  // 숨겨진 시트는 제외하고, 보이는 시트 중 이름/내용에 보수·급여 관련 단어가 있는 시트를 후보로 삼는다.
+  // 후보 중 실제 보수표 헤더(직명 + 본봉/기본급 + 지급액계)가 잡히는 시트를 최우선으로 선택한다.
+  const keywords = ["교직원보수일람표", "보수기준", "보수", "급여", "봉급", "인건비", "교직원"];
+  const candidates = sheets.filter(s => s.visible !== false && s.available && s.matrix && s.matrix.length);
+
+  const scored = candidates.map((s, index) => {
+    const nameNorm = norm(s.name);
+    const textNorm = norm(s.text);
+    const hasSalaryHeader = hasSalaryTableHeader(s.matrix);
+    let score = 0;
+    if (hasSalaryHeader) score += 1000;
+    keywords.forEach((kw, i) => {
+      const k = norm(kw);
+      if (nameNorm.includes(k)) score += 200 - i * 10;
+      if (textNorm.includes(k)) score += 40 - i;
+    });
+    if (textNorm.includes("소계(교원)") || textNorm.includes("소계교원")) score += 80;
+    if (textNorm.includes("소계(직원)") || textNorm.includes("소계직원") || textNorm.includes("소계(일반직)") || textNorm.includes("소계일반직")) score += 80;
+    return { sheet: s, score, index };
+  }).filter(x => x.score > 0).sort((a, b) => b.score - a.score || a.index - b.index);
+
+  return scored[0]?.sheet || null;
+}
+
+function hasSalaryTableHeader(matrix) {
+  return matrix.some(row => {
+    const rowText = norm(row.join(" "));
+    return rowText.includes("직명")
+      && (rowText.includes("본봉") || rowText.includes("기본급"))
+      && (rowText.includes("지급액계") || rowText.includes("지급액") || rowText.includes("급여계"));
+  });
 }
 
 function inferSalaryData(matrix) {
@@ -688,7 +730,7 @@ function buildDebug(excel, groups, pdf) {
   const teacher = info?.sections?.teacher || blankSection("교원");
   const staff = info?.sections?.staff || blankSection("직원");
   return [
-    `선택된 보수 시트: ${excel.salarySheet?.name || "확인 불가"}` ,
+    `선택된 보수/급여 시트: ${excel.salarySheet?.name || "확인 불가"}` ,
     `월급여/비월정수당 등 기타 시트: 검토 제외`,
     `보수 대상 행: ${excel.salaryRows.length}건`,
     `교원 구간: ${teacher.startRow || "?"}~${teacher.endRow || "?"}행 / 소계행 ${teacher.subtotalRow || "?"}`,
