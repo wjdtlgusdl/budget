@@ -60,7 +60,8 @@ function renderSummary(results, excelFacts, pdfText) {
       <div class="metric"><strong>${counts['미편성'] || 0}</strong><span>미편성</span></div>
       <div class="metric"><strong>${(counts['통합편성 의심'] || 0) + (counts['타 목 편성'] || 0) + (counts['부적정'] || 0)}</strong><span>확인 필요</span></div>
     </div>
-    <p class="lead">엑셀 시트 ${excelFacts.sheetNames.length}개, PDF 텍스트 ${pdfText.raw.length.toLocaleString()}자를 분석했습니다.</p>`;
+    <p class="lead">엑셀 시트 ${excelFacts.sheetNames.length}개, PDF 텍스트 ${pdfText.raw.length.toLocaleString()}자를 분석했습니다. 숨겨진 세출예산명세서 보조근거 ${excelFacts.budgetPages?.length || 0}행도 함께 확인했습니다.</p>
+    ${(excelFacts.diagnostics || []).length ? `<p class="warning">${excelFacts.diagnostics.map(escapeHtml).join('<br>')}</p>` : ''}`;
 }
 
 function renderTable(results) {

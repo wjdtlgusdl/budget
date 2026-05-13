@@ -5,13 +5,28 @@ const WRONG_BUCKET_HINTS = ['급식비', '급식운영', '운영비', '교육활
 
 export function runReview(excelFacts, pdfText, options) {
   const results = [];
+  const reviewSource = mergeReviewSources(pdfText, excelFacts);
   for (const item of excelFacts.salaryItems) {
-    results.push(reviewSalaryItem(item, pdfText, options));
+    results.push(reviewSalaryItem(item, reviewSource, options));
+  }
+  if (!excelFacts.salaryItems.length) {
+    results.push({
+      category: '진단', item: '검토 항목 추출', excelAmount: null, pdfAmount: null, diff: null, status: '확인필요',
+      reason: (excelFacts.diagnostics || []).join(' ') || '검토 대상 항목이 추출되지 않았습니다.', evidence: ''
+    });
   }
   if (excelFacts.retirement.hasAmount) {
     results.push(reviewRetirement(excelFacts.retirement, pdfText, options));
   }
   return prioritize(results);
+}
+
+function mergeReviewSources(pdfText, excelFacts) {
+  const pages = [
+    ...(pdfText?.pages || []),
+    ...(excelFacts?.budgetPages || []),
+  ];
+  return { raw: `${pdfText?.raw || ''}\n${pages.map((p) => p.text).join('\n')}`, pages };
 }
 
 function reviewSalaryItem(item, pdfText, options) {
@@ -33,8 +48,8 @@ function reviewSalaryItem(item, pdfText, options) {
   }
 
   const pdfAmount = inferPdfAmount(best.text, item.amount, options.allowTruncation);
-  const wrongBucket = options.searchWholePdf && WRONG_BUCKET_HINTS.some((kw) => best.text.includes(kw)) && !HUMAN_COST_HINTS.some((kw) => best.text.includes(kw));
-  const integratedAllowance = item.category === '수당' && /교원수당|직원수당/.test(best.text) && !best.text.includes(item.item);
+  const wrongBucket = options.searchWholePdf && WRONG_BUCKET_HINTS.some((kw) => best.text.includes(kw)) && !/급여|수당|인건비|법정부담|퇴직/.test(best.text);
+  const integratedAllowance = item.category === '수당' && /교원수당|직원수당/.test(best.text);
 
   if (wrongBucket) {
     return {
@@ -165,6 +180,8 @@ function splitContext(text) {
 }
 
 function inferPdfAmount(text, excelAmount, allowTruncation) {
+  const formulaTotal = extractFormulaTotal(text);
+  if (formulaTotal) return formulaTotal;
   const nums = extractNumbers(text).filter((n) => n > 0);
   if (!nums.length) return null;
   const candidates = new Set();
@@ -176,6 +193,13 @@ function inferPdfAmount(text, excelAmount, allowTruncation) {
     return [...candidates].sort((a, b) => Math.abs(a - excelAmount) - Math.abs(b - excelAmount))[0];
   }
   return Math.max(...candidates);
+}
+
+function extractFormulaTotal(text) {
+  const clean = String(text || '').replace(/,/g, '');
+  const eqMatches = [...clean.matchAll(/=\s*(\d{4,})/g)].map((m) => Number(m[1]));
+  if (eqMatches.length) return Math.max(...eqMatches);
+  return null;
 }
 
 function extractNumbers(text) {
