@@ -219,34 +219,97 @@ function immediateSectionTotal(window){
   if (nums.length >= 3) return nums[nums.length-1] * 1000;
   return null;
 }
-function extractStatementAmount(statementText, terms, options={}){
-  const { compact, map } = buildNormMap(statementText);
-  const found = [];
-  for (const term of terms) {
-    const nt = norm(term);
-    if (!nt) continue;
-    let pos = 0;
-    while ((pos = compact.indexOf(nt, pos)) !== -1) {
-      const orig = map[pos] ?? 0;
-      const window = statementText.slice(Math.max(0, orig - 80), Math.min(statementText.length, orig + 360));
-      const section = immediateSectionTotal(window);
-      const candidates = amountCandidates(window);
-      found.push({term, pos:orig, window, section, candidates});
-      pos += nt.length;
+
+function lineInfo(statementText){
+  const lines = statementText.split(/\n+/).map(x => x.trim()).filter(Boolean);
+  return lines;
+}
+function lineHasAmountOnly(line){
+  return /^([0-9]{1,3}(?:,[0-9]{3})+|0)(\s+([0-9]{1,3}(?:,[0-9]{3})+|0)){1,5}$/.test(line.trim());
+}
+function parseLineAmounts(line){
+  return [...String(line).matchAll(/([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})/g)].map(m => money(m[1])).filter(v => v !== null);
+}
+function looksLikeFormulaLine(line){
+  return /=\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})/.test(line) || /원\s*\*/.test(line);
+}
+function headerTotalFromLines(lines, idx){
+  // 세출예산명세서 목 행은 보통 항목명 다음 줄에 예산액/전년도/증감 숫자가 나오며, 단위는 천원입니다.
+  for (let j=idx; j<Math.min(lines.length, idx+5); j++) {
+    const nums = parseLineAmounts(lines[j]);
+    if (j === idx && nums.length && !lineHasAmountOnly(lines[j])) continue;
+    if (nums.length >= 3) return nums[0] * 1000;
+    if (nums.length === 1 && lineHasAmountOnly(lines[j])) return nums[0] * 1000;
+  }
+  return null;
+}
+function isLikelyHeaderLine(line, term){
+  const nline = norm(line), nt = norm(term);
+  if (!nline.includes(nt)) return false;
+  if (looksLikeFormulaLine(line)) return false;
+  // 산출기초 문장보다 목/세목 제목에 가까운 줄을 우선 사용
+  return nline === nt || nline.startsWith(nt) || lineHasAmountOnly(line.replace(term,''));
+}
+function collectSectionLines(lines, headerIdx){
+  const out = [];
+  const knownTerms = splitKeys(DEFAULTS.salaryKeys + ',' + DEFAULTS.allowanceKeys + ',' + DEFAULTS.retireKeys)
+    .map(norm).filter(Boolean);
+  for (let j=headerIdx+1; j<Math.min(lines.length, headerIdx+28); j++) {
+    const ln = lines[j];
+    const n = norm(ln);
+    // 다음 목/세목 제목처럼 보이면 중단. 단, 산출기초 줄의 항목명은 허용.
+    if (j > headerIdx+2 && knownTerms.some(t => n === t || (n.startsWith(t) && !looksLikeFormulaLine(ln))) && !looksLikeFormulaLine(ln)) break;
+    if (/합계|세입예산|세출예산|페이지|발행일/.test(n) && j > headerIdx+4) break;
+    out.push(ln);
+  }
+  return out;
+}
+function basisAmountsFromSection(sectionLines, terms){
+  const nterms = terms.map(norm).filter(Boolean);
+  const amounts = [];
+  for (let i=0; i<sectionLines.length; i++) {
+    const line = sectionLines[i];
+    const n = norm(line);
+    const lineAndNext = [line, sectionLines[i+1] || ''].join(' ');
+    const n2 = norm(lineAndNext);
+    if (!nterms.some(t => n.includes(t) || n2.includes(t))) continue;
+    const eqs = [...lineAndNext.matchAll(/=\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{5,})/g)].map(m => money(m[1])).filter(v => v !== null);
+    eqs.forEach(v => amounts.push(v));
+  }
+  return amounts;
+}
+function extractStatementEntry(statementText, terms, group){
+  const scopedText = group ? groupSegment(statementText, group) : statementText;
+  const lines = lineInfo(scopedText);
+  const matches = [];
+  for (let i=0; i<lines.length; i++) {
+    for (const term of terms) {
+      if (!norm(term)) continue;
+      if (!norm(lines[i]).includes(norm(term))) continue;
+      const headerLike = isLikelyHeaderLine(lines[i], term);
+      const total = headerLike ? headerTotalFromLines(lines, i) : null;
+      const sectionLines = headerLike ? collectSectionLines(lines, i) : lines.slice(i, Math.min(lines.length, i+8));
+      const basisAmounts = basisAmountsFromSection(sectionLines, terms);
+      const basisTotal = basisAmounts.length ? basisAmounts.reduce((a,b)=>a+b,0) : null;
+      matches.push({term, idx:i, headerLike, total, basisTotal, basisAmounts, evidence:[lines[i],...sectionLines.slice(0,8)].join(' ').slice(0,320)});
     }
   }
-  if (!found.length) return {found:false, amount:null, term:'', evidence:''};
-
-  if (options.preferSectionTotal) {
-    const withSection = found.find(f => f.section !== null && f.section > 0);
-    if (withSection) return {found:true, amount:withSection.section, term:withSection.term, evidence:withSection.window.trim().slice(0,240)};
-  }
-  const exactTerm = found.find(f => f.candidates.some(c => c.source === '산출기초'));
-  if (exactTerm) return {found:true, amount:exactTerm.candidates.find(c => c.source === '산출기초').value, term:exactTerm.term, evidence:exactTerm.window.trim().slice(0,240)};
-  const anySection = found.find(f => f.section !== null && f.section > 0);
-  if (anySection) return {found:true, amount:anySection.section, term:anySection.term, evidence:anySection.window.trim().slice(0,240)};
-  const any = found.find(f => f.candidates.length);
-  return {found:true, amount:any ? any.candidates[0].value : null, term: found[0].term, evidence: found[0].window.trim().slice(0,240)};
+  if (!matches.length) return {found:false, term:'', sectionTotal:null, basisTotal:null, amount:null, evidence:''};
+  // 1) 같은 목 제목에서 목합계가 있는 항목을 최우선
+  let best = matches.find(m => m.headerLike && m.total !== null) || matches.find(m => m.basisTotal !== null) || matches[0];
+  const amount = best.basisTotal !== null ? best.basisTotal : best.total;
+  return {
+    found:true,
+    term:best.term,
+    sectionTotal:best.total,
+    basisTotal:best.basisTotal,
+    amount,
+    evidence:best.evidence || ''
+  };
+}
+function extractStatementAmount(statementText, terms, options={}){
+  const entry = extractStatementEntry(statementText, terms, options.group || '');
+  return {found:entry.found, amount:entry.amount, term:entry.term, evidence:entry.evidence, sectionTotal:entry.sectionTotal, basisTotal:entry.basisTotal};
 }
 function bundleFound(statementText, group, cfg){
   const b = splitKeys(cfg.bundleKeys).flatMap(k => k === '수당' && group && group !== '미분류' ? [`${group}${k}`, k] : [k]);
@@ -257,8 +320,10 @@ function compareItems(items, statementText, cfg){
   const rows = items.map(it => {
     const isRetirement = it.category === '퇴직적립금';
     const preferSectionTotal = /교원급여|직원급여/.test(norm(it.item));
-    const found = extractStatementAmount(statementText, it.matchTerms || aliasesFor(it.item,it.group), {preferSectionTotal});
+    const found = extractStatementAmount(statementText, it.matchTerms || aliasesFor(it.item,it.group), {preferSectionTotal, group: it.group});
     const statementAmount = (!isRetirement && found.found) ? found.amount : null;
+    const sectionTotal = (!isRetirement && found.found) ? found.sectionTotal : null;
+    const basisTotal = (!isRetirement && found.found) ? found.basisTotal : null;
     const diff = (!isRetirement && statementAmount !== null) ? it.amount - statementAmount : null;
     const hasBundle = it.category === '수당' && bundleFound(statementText, it.group, cfg);
     let status, memo;
@@ -284,7 +349,9 @@ function compareItems(items, statementText, cfg){
       비교기준항목: it.item,
       예산서금액: it.amount,
       명세서대응항목: found.found ? found.term : (hasBundle ? `${it.group}수당 통합 항목` : ''),
-      명세서금액: statementAmount,
+      명세서목합계: sectionTotal,
+      산출기초합계: basisTotal,
+      비교명세서금액: statementAmount,
       차액: diff,
       판정: status,
       검토메모: memo,
@@ -331,7 +398,9 @@ function statementOnlyChecks(items, statementText){
       비교기준항목: chk.item,
       예산서금액: null,
       명세서대응항목: found.term,
-      명세서금액: found.amount,
+      명세서목합계: found.sectionTotal,
+      산출기초합계: found.basisTotal,
+      비교명세서금액: found.amount,
       차액: null,
       판정: '보수일람표 미반영',
       검토메모: `${chk.item}가 세출예산명세서 산출내역에 있으나 교직원보수일람표 소계 항목에는 없습니다.`,
@@ -357,11 +426,11 @@ function renderSummary(rows){
 
 function renderTable(){
   const rows = showingOnlyIssues ? resultRows.filter(r => !['일치','항목 있음'].includes(r.판정)) : resultRows;
-  const headers = ['구분','검토분류','예산서항목','비교기준항목','예산서금액','명세서대응항목','명세서금액','차액','판정','검토메모','예산서시트','예산서행'];
+  const headers = ['구분','검토분류','예산서항목','비교기준항목','예산서금액','명세서대응항목','명세서목합계','산출기초합계','비교명세서금액','차액','판정','검토메모','예산서시트','예산서행'];
   const table = $('resultTable');
   table.innerHTML = '<thead><tr>' + headers.map(h=>`<th>${h}</th>`).join('') + '</tr></thead><tbody>' +
     rows.map(r => '<tr>' + headers.map(h => {
-      const val = ['예산서금액','명세서금액','차액'].includes(h) ? fmt(r[h]) : (r[h] ?? '');
+      const val = ['예산서금액','명세서목합계','산출기초합계','비교명세서금액','차액'].includes(h) ? fmt(r[h]) : (r[h] ?? '');
       const cls = h === '판정' ? ` class="status-${String(r[h]).replace(/\s/g,'')}"` : '';
       return `<td${cls}>${escapeHtml(val)}</td>`;
     }).join('') + '</tr>').join('') + '</tbody>';
