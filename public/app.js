@@ -339,13 +339,13 @@ function extractBudgetItems(lines){
     const totalRow = parseTotalBudgetRow(t);
     if(totalRow){
       currentTotal = {항목:totalRow.항목, 페이지:l.page, 행:i+1, 금액:totalRow.금액};
-      out.push({페이지:l.page, 행:i+1, 상위항목:'', 항목:totalRow.항목, PDF금액:totalRow.금액, PDF금액천원:Math.round(totalRow.금액/1000), 인원:null, 산출기초:'', 구분:'총액행'});
+      out.push({페이지:l.page, 행:i+1, 목:totalRow.항목, 상위항목:'', 항목:totalRow.항목, PDF금액:totalRow.금액, PDF금액천원:Math.round(totalRow.금액/1000), 인원:null, 산출기초:'', 구분:'총액행'});
       continue;
     }
     const calc = parseCalcLine(t);
     if(calc){
       const name = findCalcName(lines, i) || currentTotal?.항목 || '산출항목미상';
-      out.push({페이지:l.page, 행:i+1, 상위항목:currentTotal?.항목 || '', 항목:name, PDF금액:calc.amount, PDF금액천원:Math.round(calc.amount/1000), 인원:calc.people, 산출기초:t, 구분:'산출기초'});
+      out.push({페이지:l.page, 행:i+1, 목:currentTotal?.항목 || '', 상위항목:currentTotal?.항목 || '', 항목:name, PDF금액:calc.amount, PDF금액천원:Math.round(calc.amount/1000), 인원:calc.people, 산출기초:t, 구분:'산출기초'});
     }
   }
   return out.filter(x=>!LEGAL_RE.test(x.항목));
@@ -432,7 +432,8 @@ function buildPrecheck(report){
   // 동적 인건비 오편성 탐지: 명확한 항목명·금액·상위 과목이 있는 경우만 지적합니다.
   const laborRe = /(급여|인건비|보수|상여금|수당)$/;
   const specificLaborRe = /(원장|교원|교사|방과후|사무|조리|영양사|보조교사|차량기사|차량보조|환경미화|직원).*(급여|인건비|보수)|차량기사급여|영양사인건비|영양사급여/;
-  const allowedParentRe = /(교원인건비|직원인건비|그밖의인건비)/;
+  // PDF 표의 '목' 기준으로 정상 편성 여부를 봅니다. 관/항은 판정에 사용하지 않습니다.
+  const allowedMokRe = /(교원급여|교원수당|직원급여|직원수당|그밖의인건비|그밖의인건비|교원인건비|직원인건비)/;
   const wrongMap = new Map();
   for(const x of calcs){
     if(!x || !x.항목 || !x.PDF금액) continue;
@@ -440,12 +441,12 @@ function buildPrecheck(report){
     if(/퇴직|적립금/.test(x.항목)) continue;
     const isLabor = specificLaborRe.test(x.항목) || (laborRe.test(x.항목) && /(명\*|명)/.test(x.산출기초 || ''));
     if(!isLabor) continue;
-    const parent = x.상위항목 || '';
-    if(!parent || allowedParentRe.test(parent)) continue;
-    const key = `${x.항목}|${parent}|${x.PDF금액}`;
+    const mok = x.목 || x.상위항목 || '';
+    if(!mok || allowedMokRe.test(mok)) continue;
+    const key = `${x.항목}|${mok}|${x.PDF금액}`;
     if(wrongMap.has(key)) continue;
     wrongMap.set(key, x);
-    addIssue(`${x.항목} ${Math.round(x.PDF금액/10000).toLocaleString('ko-KR')}만원을 인건비 과목이 아닌 ${parent}의 산출내역에 편성`, `PDF ${x.페이지}쪽: ${x.산출기초}`);
+    addIssue(`${x.항목} ${Math.round(x.PDF금액/10000).toLocaleString('ko-KR')}만원을 직원·교원 인건비 목이 아닌 ${mok} 목의 산출내역에 편성`, `PDF ${x.페이지}쪽: ${x.산출기초}`);
   }
 
   const excelRetire = (report.excel?.retirement || []).some(r=>r.hasRetirementAmount);
@@ -535,7 +536,7 @@ function render(report){
   if(report.pdf){
     const pdf=report.pdf;
     $('pdfSummary').innerHTML = `<span class="pill">파일 ${escapeHtml(pdf.fileName)}</span><span class="pill">${pdf.pageCount}페이지</span><span class="pill">항목 ${pdf.items.length}개</span>`;
-    let html = '<h3 class="section-title">PDF 추출 항목</h3>'+table(['구분','페이지','항목','PDF금액','PDF금액천원','인원','산출기초'], pdf.items.map(x=>({...x,PDF금액:fmt(x.PDF금액)})));
+    let html = '<h3 class="section-title">PDF 추출 항목</h3>'+table(['구분','페이지','목','항목','PDF금액','PDF금액천원','인원','산출기초'], pdf.items.map(x=>({...x,PDF금액:fmt(x.PDF금액)})));
     html += '<h3 class="section-title">PDF 원문 라인</h3>'+table(['페이지','y','텍스트'], pdf.lines.slice(0,300), {small:true});
     $('pdfTables').innerHTML = html;
   }
