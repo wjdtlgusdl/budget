@@ -1,72 +1,57 @@
 <!doctype html>
 <html lang="ko">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>예산서 검토 웹앱</title>
-  <link rel="stylesheet" href="style.css" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>예산서 검토 · 파싱 디버그</title>
+  <link rel="stylesheet" href="./style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 </head>
 <body>
   <header class="hero">
     <div>
-      <p class="eyebrow">정적 웹앱 · 브라우저 내부 처리</p>
-      <h1>예산서 검토 도구</h1>
-      <p class="lead">교직원 보수기준 엑셀과 세출예산명세서 PDF를 비교하여 인건비 금액·인원, 수당 통합편성, 퇴직적립금, 오편성 항목을 검토합니다.</p>
+      <p class="eyebrow">Budget Review Parser Debug</p>
+      <h1>예산서 검토용 값 추출 점검</h1>
+      <p>검토 판정 전에 엑셀과 PDF에서 어떤 값이 읽혔는지 먼저 확인하는 버전입니다.</p>
     </div>
   </header>
 
-  <main class="container">
-    <section class="card grid two">
-      <label class="upload-box">
-        <span class="label-title">① 교직원보수기준 엑셀</span>
+  <main class="wrap">
+    <section class="card grid2">
+      <label class="upload">엑셀 예산서(.xlsx)
         <input id="excelFile" type="file" accept=".xlsx,.xls" />
-        <span class="hint">예: 2026학년도 예산서.xlsx</span>
       </label>
-      <label class="upload-box">
-        <span class="label-title">② 세출예산명세서 PDF</span>
+      <label class="upload">PDF 세출예산명세서(.pdf)
         <input id="pdfFile" type="file" accept=".pdf" />
-        <span class="hint">예: 세출예산명세서.pdf</span>
       </label>
+      <div class="actions">
+        <button id="runBtn">값 추출하기</button>
+        <button id="downloadBtn" disabled>JSON 다운로드</button>
+      </div>
     </section>
 
-    <section class="actions">
-      <button id="runBtn">검토 시작</button>
-      <button id="sampleRulesBtn" class="ghost">검토 규칙 보기</button>
-    </section>
-
-    <section id="status" class="status" hidden></section>
-
-    <section id="summary" class="summary" hidden></section>
+    <section id="status" class="status hidden"></section>
 
     <section class="card">
-      <h2>검토 결과</h2>
-      <div id="results" class="results-empty">엑셀과 PDF를 업로드한 뒤 검토를 시작하세요.</div>
+      <h2>1. 엑셀 파싱 결과</h2>
+      <div id="excelSummary" class="muted">아직 실행하지 않았습니다.</div>
+      <div id="excelTables"></div>
     </section>
 
-    <section class="card details">
-      <h2>추출 원문 및 진단 로그</h2>
-      <pre id="debugLog">아직 실행 전입니다.</pre>
+    <section class="card">
+      <h2>2. PDF 파싱 결과</h2>
+      <div id="pdfSummary" class="muted">아직 실행하지 않았습니다.</div>
+      <div id="pdfTables"></div>
+    </section>
+
+    <section class="card">
+      <h2>3. 검토 로직 적용 전 점검표</h2>
+      <p class="muted">아래 표가 맞게 읽히면 다음 버전에서 이 값을 기준으로 검토 판정을 붙입니다.</p>
+      <div id="precheck"></div>
     </section>
   </main>
 
-  <dialog id="rulesDialog">
-    <h2>현재 반영된 검토 규칙</h2>
-    <ol>
-      <li>PDF 금액은 천원 단위로 보고, 엑셀 원 단위 금액과 비교합니다.</li>
-      <li>교원급여는 원장과 교사를 포함한 인원수와 PDF 산출기초 인원수를 비교합니다.</li>
-      <li>수당은 개별 항목이 PDF에 있으면 직접 비교하고, 없으면 교원수당/직원수당 통합편성 가능성을 합산 검토합니다.</li>
-      <li>엑셀 퇴직금 관련 시트에 적립금액이 있으면 PDF에 퇴직 관련 편성 여부만 확인합니다.</li>
-      <li>오편성은 항목명·금액·PDF 위치가 확인되는 경우만 표시합니다.</li>
-    </ol>
-    <button id="closeRulesBtn">닫기</button>
-  </dialog>
-
-  <footer>
-    <p>파일은 서버로 전송되지 않고 브라우저에서만 처리됩니다. 공개 배포 전 실제 양식별 검증을 권장합니다.</p>
-  </footer>
-
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-  <script src="app.js"></script>
+  <script src="./app.js"></script>
 </body>
 </html>
