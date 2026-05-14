@@ -1,21 +1,58 @@
 <!doctype html>
 <html lang="ko">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>예산서 검토 앱</title>
-<link rel="stylesheet" href="style.css">
-<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>예산서 검토 · v20</title>
+  <link rel="stylesheet" href="./style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 </head>
 <body>
-<div class="wrap">
-<h1>예산서 검토 앱</h1>
-<input type="file" id="excel" accept=".xlsx,.xls">
-<input type="file" id="pdf" accept=".pdf">
-<button id="runBtn">검토 실행</button>
-<pre id="debug"></pre>
-<div id="results"></div>
-</div>
-<script src="app.js"></script>
+  <header class="hero">
+    <div>
+      <p class="eyebrow">Budget Review v20</p>
+      <h1>예산서 검토용 값 추출 및 1차 검토</h1>
+      <p>엑셀 원시 파서와 PDF 산출항목 블록 추출을 기준으로 금액·인원·지적사항을 함께 확인합니다.</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="card grid2">
+      <label class="upload">엑셀 예산서(.xlsx)
+        <input id="excelFile" type="file" accept=".xlsx,.xls" />
+      </label>
+      <label class="upload">PDF 세출예산명세서(.pdf)
+        <input id="pdfFile" type="file" accept=".pdf" />
+      </label>
+      <div class="actions">
+        <button id="runBtn">값 추출하기</button>
+        <button id="downloadBtn" disabled>JSON 다운로드</button>
+      </div>
+    </section>
+
+    <section id="status" class="status hidden"></section>
+
+    <section class="card">
+      <h2>1. 엑셀 파싱 결과</h2>
+      <div id="excelSummary" class="muted">아직 실행하지 않았습니다.</div>
+      <div id="excelTables"></div>
+    </section>
+
+    <section class="card">
+      <h2>2. PDF 파싱 결과</h2>
+      <div id="pdfSummary" class="muted">아직 실행하지 않았습니다.</div>
+      <div id="pdfTables"></div>
+    </section>
+
+    <section class="card">
+      <h2>3. 1차 검토 결과</h2>
+      <p class="muted">수당 PDF 추출은 총액행과 산출기초를 분리해 표시하며, 통합편성 여부는 추가확인 문구로 구분합니다.</p>
+      <div id="precheck"></div>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
 </body>
 </html>
