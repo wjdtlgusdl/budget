@@ -54,6 +54,42 @@ $('downloadBtn').addEventListener('click', () => {
 
 async function parseExcel(file){
   const originalBuf = await file.arrayBuffer();
+
+  // 1순위: XLSX 내부 XML 직접 파싱. HCell/한컴 계열 파일에서 SheetJS가 빈 시트로 읽는 경우를 보정합니다.
+  let rawBook = null;
+  try{
+    rawBook = await readXlsxRawWorkbook(originalBuf);
+  }catch(e){
+    console.warn('Raw XLSX parser failed, falling back to SheetJS:', e);
+  }
+
+  if(rawBook){
+    const visible = rawBook.sheets.filter(s=>!s.hidden);
+    const candidates = visible.map(s=>({ ...s, score: sheetScore(s.name) }))
+      .filter(s=>s.score>0).sort((a,b)=>b.score-a.score);
+    let salary = null;
+    const tried = [];
+    for(const c of candidates){
+      const aoa = await rawBook.getAoa(c.name);
+      const parsed = parseSalarySheet(c.name, aoa);
+      tried.push({sheet:c.name, score:c.score, found:!!parsed.ok, message:parsed.message || ''});
+      if(parsed.ok){ salary = parsed; break; }
+    }
+    const retireSheets = visible
+      .filter(s=>RETIRE_RE.test(s.name))
+      .map(async s=>parseRetireSheet(s.name, await rawBook.getAoa(s.name)));
+    const retireSheetsResolved = await Promise.all(retireSheets);
+    return {
+      fileName:file.name,
+      parser:'raw-xlsx-xml',
+      visibleSheets:visible.map(s=>s.name),
+      salaryCandidates:tried,
+      salary,
+      retirement:retireSheetsResolved
+    };
+  }
+
+  // 2순위: 일반 XLSX 파일은 SheetJS 경로로 읽습니다.
   const normalizedBuf = await normalizeXlsxForSheetJS(originalBuf);
   const wb = XLSX.read(normalizedBuf, { type:'array', cellDates:false, cellNF:false, cellText:true, raw:false, WTF:false });
   const sheetMeta = (wb.Workbook && wb.Workbook.Sheets) || [];
@@ -69,7 +105,101 @@ async function parseExcel(file){
     if(parsed.ok){ salary = parsed; break; }
   }
   const retireSheets = visible.filter(s=>RETIRE_RE.test(s.name)).map(s=>parseRetireSheet(s.name, XLSX.utils.sheet_to_json(wb.Sheets[s.name], {header:1, raw:false, defval:''})));
-  return { fileName:file.name, visibleSheets:visible.map(s=>s.name), salaryCandidates:tried, salary, retirement:retireSheets };
+  return { fileName:file.name, parser:'sheetjs', visibleSheets:visible.map(s=>s.name), salaryCandidates:tried, salary, retirement:retireSheets };
+}
+
+async function readXlsxRawWorkbook(buf){
+  if(typeof JSZip === 'undefined') throw new Error('JSZip이 로드되지 않았습니다.');
+  const zip = await JSZip.loadAsync(buf);
+  const workbookFile = zip.file('xl/workbook.xml');
+  const relsFile = zip.file('xl/_rels/workbook.xml.rels');
+  if(!workbookFile || !relsFile) throw new Error('workbook.xml을 찾지 못했습니다.');
+  const parser = new DOMParser();
+  const workbookXml = parser.parseFromString(await workbookFile.async('string'), 'application/xml');
+  const relsXml = parser.parseFromString(await relsFile.async('string'), 'application/xml');
+  const relMap = {};
+  localElements(relsXml, 'Relationship').forEach(el=>{
+    relMap[el.getAttribute('Id')] = el.getAttribute('Target');
+  });
+
+  const sharedStrings = await readSharedStrings(zip, parser);
+  const sheets = localElements(workbookXml, 'sheet').map(el=>{
+    const rid = el.getAttribute('r:id') || el.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships','id');
+    const target = relMap[rid] || '';
+    const path = target.startsWith('/') ? target.slice(1) : 'xl/' + target.replace(/^\.\.\//,'');
+    const state = el.getAttribute('state') || '';
+    return {
+      name: el.getAttribute('name'),
+      rid,
+      path,
+      hidden: state === 'hidden' || state === 'veryHidden'
+    };
+  }).filter(s=>s.name && s.path);
+
+  const cache = new Map();
+  const getAoa = async (sheetName) => {
+    if(cache.has(sheetName)) return cache.get(sheetName);
+    const meta = sheets.find(s=>s.name===sheetName);
+    if(!meta) return [];
+    const aoa = await sheetXmlToAoa(zip, meta.path, sharedStrings, parser);
+    cache.set(sheetName, aoa);
+    return aoa;
+  };
+
+  return {sheets, getAoa};
+}
+
+async function readSharedStrings(zip, parser){
+  const f = zip.file('xl/sharedStrings.xml');
+  if(!f) return [];
+  const xml = parser.parseFromString(await f.async('string'), 'application/xml');
+  return localElements(xml, 'si').map(si => localElements(si, 't').map(t=>t.textContent || '').join(''));
+}
+
+function localElements(root, localName){
+  return Array.from(root.getElementsByTagName('*')).filter(el=>el.localName === localName);
+}
+
+async function sheetXmlToAoa(zip, path, sharedStrings, parser){
+  const f = zip.file(path);
+  if(!f) return [];
+  const xml = parser.parseFromString(await f.async('string'), 'application/xml');
+  const rows = localElements(xml, 'row');
+  const aoa = [];
+  for(const row of rows){
+    const rIdx = Number(row.getAttribute('r') || (aoa.length+1)) - 1;
+    if(!aoa[rIdx]) aoa[rIdx] = [];
+    const cells = Array.from(row.children).filter(el=>el.localName === 'c');
+    for(const c of cells){
+      const ref = c.getAttribute('r') || '';
+      const cIdx = ref ? colRefToIndex(ref) : aoa[rIdx].length;
+      aoa[rIdx][cIdx] = cellValue(c, sharedStrings);
+    }
+  }
+  return aoa.map(r => r || []);
+}
+function colRefToIndex(ref){
+  const letters = String(ref).match(/[A-Z]+/i)?.[0]?.toUpperCase() || 'A';
+  let n = 0;
+  for(const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n - 1;
+}
+function cellValue(cell, sharedStrings){
+  const t = cell.getAttribute('t');
+  const vEl = Array.from(cell.children).find(el=>el.localName === 'v');
+  const fEl = Array.from(cell.children).find(el=>el.localName === 'f');
+  if(t === 'inlineStr'){
+    return localElements(cell, 't').map(x=>x.textContent || '').join('');
+  }
+  const raw = vEl ? (vEl.textContent || '') : '';
+  if(t === 's') return sharedStrings[Number(raw)] ?? '';
+  if(t === 'str') return raw;
+  if(raw !== ''){
+    const n = Number(raw);
+    return Number.isFinite(n) && /^-?\d+(\.\d+)?$/.test(raw) ? n : raw;
+  }
+  // 수식 셀에 계산 캐시가 없으면 수식 문자열을 남겨 디버그에서 확인할 수 있게 합니다.
+  return fEl ? '=' + (fEl.textContent || '') : '';
 }
 
 async function normalizeXlsxForSheetJS(buf){
