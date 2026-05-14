@@ -85,40 +85,77 @@ function scoreSalarySheet(sheet) {
 }
 
 function parseSalarySheet(sheet) {
-  const m = sheet.matrix;
+  const m = sheet.matrix || [];
   const maxCols = Math.max(...m.map(r => r.length), 0);
 
-  // 한셀/엑셀 양식은 헤더가 2행 이상으로 나뉘거나 병합셀 때문에 같은 행에 안 잡힐 수 있습니다.
-  // 따라서 현재 행 + 다음 2행을 합쳐서 직명/본봉/지급액계를 찾습니다.
+  // 헤더 탐색을 “같은 행 텍스트”에 의존하지 않습니다.
+  // 병합셀/줄바꿈/2단 헤더 때문에 직명·본봉·지급액계가 서로 다른 행에 걸쳐 있어도
+  // 상단 30행에서 각 열을 독립적으로 찾아냅니다.
+  const scanRows = Math.min(30, m.length);
+  const colText = (c, r1 = 0, r2 = scanRows) => {
+    const parts = [];
+    for (let r = r1; r < r2; r++) parts.push(String((m[r] || [])[c] ?? ""));
+    return norm(parts.join(" "));
+  };
+  const cellText = (r, c) => norm(String((m[r] || [])[c] ?? ""));
+
+  let jobCol = -1, baseCol = -1, totalCol = -1;
   let headerIndex = -1;
-  for (let r = 0; r < m.length; r++) {
-    const blockText = norm([m[r] || [], m[r + 1] || [], m[r + 2] || []].flat().join(" "));
-    if (blockText.includes("직명") && (blockText.includes("본봉") || blockText.includes("기본급")) && blockText.includes("지급액계")) {
-      headerIndex = r;
-      break;
+
+  // 1) 셀 단위로 가장 확실한 위치 찾기
+  for (let r = 0; r < scanRows; r++) {
+    for (let c = 0; c < maxCols; c++) {
+      const t = cellText(r, c);
+      if (jobCol < 0 && t.includes("직명")) { jobCol = c; headerIndex = Math.max(headerIndex, r); }
+      if (baseCol < 0 && (t.includes("본봉") || t.includes("기본급"))) { baseCol = c; headerIndex = Math.max(headerIndex, r); }
+      if (totalCol < 0 && t.includes("지급액계")) { totalCol = c; headerIndex = Math.max(headerIndex, r); }
     }
   }
-  if (headerIndex < 0) {
+
+  // 2) 그래도 못 찾으면 열 전체 상단 텍스트로 찾기
+  for (let c = 0; c < maxCols; c++) {
+    const t = colText(c);
+    if (jobCol < 0 && t.includes("직명")) jobCol = c;
+    if (baseCol < 0 && (t.includes("본봉") || t.includes("기본급"))) baseCol = c;
+    if (totalCol < 0 && t.includes("지급액계")) totalCol = c;
+  }
+
+  // 3) 사용자 예시 양식의 고정 패턴 보정: 직명=B, 본봉=E, 지급액계=Q
+  //    단, 해당 열 근처에 관련 단어가 실제로 있을 때만 보정합니다.
+  const upperText = norm(m.slice(0, scanRows).flat().join(" "));
+  if ((jobCol < 0 || baseCol < 0 || totalCol < 0) && upperText.includes("교직원보수일람표")) {
+    if (jobCol < 0 && colText(1).includes("직명")) jobCol = 1;
+    if (baseCol < 0 && (colText(4).includes("본봉") || colText(4).includes("기본급"))) baseCol = 4;
+    if (totalCol < 0 && colText(16).includes("지급액계")) totalCol = 16;
+  }
+
+  if (jobCol < 0 || baseCol < 0 || totalCol < 0) {
     const preview = m.slice(0, 12).map((row, i) => `${i + 1}: ${row.map(v => String(v || "").replace(/\n/g, "/")).join(" | ")}`).join("\n");
     throw new Error(`보수 시트 후보(${sheet.name})에서 직명/본봉/지급액계 헤더를 찾지 못했습니다.\n상단 미리보기:\n${preview}`);
   }
 
-  const headers = Array.from({ length: maxCols }, (_, i) =>
-    norm(String((m[headerIndex] || [])[i] || "") + " " + String((m[headerIndex + 1] || [])[i] || "") + " " + String((m[headerIndex + 2] || [])[i] || ""))
-  );
-  const jobCol = headers.findIndex(h => h.includes("직명"));
-  const baseCol = headers.findIndex(h => h.includes("본봉") || h.includes("기본급"));
-  const totalCol = headers.findIndex(h => h.includes("지급액계"));
-  if (jobCol < 0 || baseCol < 0 || totalCol < 0) {
-    throw new Error(`보수 시트(${sheet.name})에서 열 위치를 찾지 못했습니다. 인식된 헤더: ${headers.filter(Boolean).join(", ")}`);
+  // 데이터 시작행: 직명 헤더가 있는 행 이후부터
+  for (let r = 0; r < scanRows; r++) {
+    if (cellText(r, jobCol).includes("직명")) { headerIndex = r; break; }
   }
+  if (headerIndex < 0) headerIndex = 0;
+
+  const headers = Array.from({ length: maxCols }, (_, c) => {
+    const parts = [];
+    for (let r = Math.max(0, headerIndex - 1); r <= Math.min(m.length - 1, headerIndex + 2); r++) {
+      parts.push(String((m[r] || [])[c] || ""));
+    }
+    return norm(parts.join(" "));
+  });
 
   const allowanceCols = [];
   for (let c = baseCol + 1; c < totalCol; c++) {
-    const h = headers[c] || `열${c + 1}`;
+    const rawHeader = headers[c] || colText(c, Math.max(0, headerIndex - 1), Math.min(m.length, headerIndex + 3));
+    const h = prettyHeader(rawHeader || `열${c + 1}`);
     if (!h || isExcluded(h)) continue;
-    allowanceCols.push({ index: c, name: prettyHeader(h) });
+    allowanceCols.push({ index: c, name: h });
   }
+
   const rows = [];
   let section = "teacher";
   for (let r = headerIndex + 1; r < m.length; r++) {
@@ -126,14 +163,19 @@ function parseSalarySheet(sheet) {
     const text = row.map(String).join(" ");
     const nt = norm(text);
     if (!nt) continue;
-    if (nt.includes("소계(교원")) { section = "staff"; continue; }
-    if (nt.includes("소계(직원") || nt.includes("소계(일반직") || nt.includes("합계(교원+일반직") || nt.includes("작성요령")) break;
+    if (nt.includes("소계교원") || nt.includes("소계(교원")) { section = "staff"; continue; }
+    if (nt.includes("소계직원") || nt.includes("소계일반직") || nt.includes("소계(직원") || nt.includes("소계(일반직") || nt.includes("합계교원일반직") || nt.includes("작성요령")) break;
+
     const job = String(row[jobCol] || "").trim();
     const name = String(row[jobCol + 1] || "").trim();
     const base = toNumber(row[baseCol]);
     const allowanceValues = allowanceCols.map(c => ({ name: c.name, amount: toNumber(row[c.index]) })).filter(x => x.amount > 0);
     const hasMoney = base > 0 || allowanceValues.length > 0;
-    if (!job || !hasMoney || nt.includes("명절휴가비") || nt.includes("성과상여금")) continue;
+
+    // 헤더/공백/합계행은 제외
+    if (!job || !hasMoney) continue;
+    if (norm(job).includes("직명") || nt.includes("일련번호") || nt.includes("소계")) continue;
+
     rows.push({ rowNumber: r + 1, section, job, name, base, allowances: allowanceValues, total: toNumber(row[totalCol]) });
   }
   return buildSalarySummary(rows, allowanceCols);
