@@ -124,10 +124,11 @@ function scoreSalarySheet(sheet) {
 function parseSalarySheet(sheet) {
   const m = sheet.matrix || [];
   const maxCols = Math.max(...m.map(r => r.length), 0);
-  const scanRows = Math.min(40, m.length);
+  const scanRows = Math.min(60, m.length);
   const cell = (r, c) => String((m[r] || [])[c] ?? "");
   const cellNorm = (r, c) => norm(cell(r, c));
-  const rowNorm = (r) => norm((m[r] || []).join(" "));
+  const rowText = (r) => (m[r] || []).map(v => String(v ?? "")).join(" ");
+  const rowNorm = (r) => norm(rowText(r));
   const colNorm = (c, r1 = 0, r2 = scanRows) => {
     const parts = [];
     for (let r = r1; r < Math.min(r2, m.length); r++) parts.push(cell(r, c));
@@ -136,7 +137,7 @@ function parseSalarySheet(sheet) {
 
   let jobCol = -1, baseCol = -1, totalCol = -1, headerIndex = -1;
 
-  // 1) 상단 셀 단위 탐색. 줄바꿈/괄호/영문기호는 norm()이 제거합니다.
+  // 1) 상단 셀/열 단위 탐색. 줄바꿈·병합 헤더를 모두 허용합니다.
   for (let r = 0; r < scanRows; r++) {
     for (let c = 0; c < maxCols; c++) {
       const t = cellNorm(r, c);
@@ -145,8 +146,6 @@ function parseSalarySheet(sheet) {
       if (totalCol < 0 && t.includes("지급액계")) { totalCol = c; headerIndex = Math.max(headerIndex, r); }
     }
   }
-
-  // 2) 열 단위 탐색. 병합셀 또는 2단 헤더 보정.
   for (let c = 0; c < maxCols; c++) {
     const t = colNorm(c);
     if (jobCol < 0 && t.includes("직명")) jobCol = c;
@@ -154,8 +153,7 @@ function parseSalarySheet(sheet) {
     if (totalCol < 0 && t.includes("지급액계")) totalCol = c;
   }
 
-  // 3) 교직원보수일람표 표준 양식 보정: B=직명, E=본봉, Q=지급액계.
-  //    실제 예시처럼 XLSX 라이브러리가 헤더 텍스트를 일부 놓치는 경우에도 중단하지 않습니다.
+  // 2) 표준 교직원보수일람표 보정: B=직명, E=본봉, Q=지급액계.
   const titleText = norm(m.slice(0, scanRows).flat().join(" ") + " " + sheet.name);
   if (titleText.includes("교직원보수일람표") || titleText.includes("보수일람표") || titleText.includes("교직원보수")) {
     if (jobCol < 0) jobCol = 1;
@@ -163,26 +161,12 @@ function parseSalarySheet(sheet) {
     if (totalCol < 0) totalCol = 16;
   }
 
-  // 4) 여전히 못 찾은 경우: 상단 20행에서 숫자 데이터 패턴으로 보정.
-  //    직명열은 문자열, 본봉열은 큰 금액, 지급액계는 본봉보다 큰 금액이 반복되는 열입니다.
-  if (jobCol < 0 || baseCol < 0 || totalCol < 0) {
-    for (let c = 0; c < maxCols; c++) {
-      const sampleVals = [];
-      for (let r = 0; r < Math.min(m.length, 80); r++) sampleVals.push(cell(r, c));
-      const txtCount = sampleVals.filter(v => /원장|교사|직원|기사|조리|방과후|미화|보조/.test(String(v))).length;
-      const moneyCount = sampleVals.filter(v => toNumber(v) >= 1000000).length;
-      if (jobCol < 0 && txtCount >= 3) jobCol = c;
-      if (baseCol < 0 && moneyCount >= 5) baseCol = c;
-    }
-    if (totalCol < 0 && baseCol >= 0) totalCol = Math.min(maxCols - 1, baseCol + 12);
-  }
-
   if (jobCol < 0 || baseCol < 0 || totalCol < 0) {
     const preview = m.slice(0, 12).map((row, i) => `${i + 1}: ${row.map(v => String(v || "").replace(/\n/g, "/")).join(" | ")}`).join("\n");
     throw new Error(`보수 시트 후보(${sheet.name})에서 직명/본봉/지급액계 헤더를 찾지 못했습니다.\n상단 미리보기:\n${preview}`);
   }
 
-  // 헤더 행은 직명 셀이 있는 행, 없으면 본봉/지급액계가 가장 가까운 행, 그래도 없으면 표준 양식 5행(0-index 4)
+  // 3) 헤더행과 소계행 탐색. 데이터행이 안 잡히는 오류를 막기 위해 소계행 기반 파싱을 우선 지원합니다.
   for (let r = 0; r < scanRows; r++) {
     if (cellNorm(r, jobCol).includes("직명") || cellNorm(r, baseCol).includes("본봉") || cellNorm(r, totalCol).includes("지급액계")) {
       headerIndex = r; break;
@@ -190,87 +174,118 @@ function parseSalarySheet(sheet) {
   }
   if (headerIndex < 0) headerIndex = 4;
 
+  const teacherSubtotalRow = findRowIndex(m, r => {
+    const t = norm(r.join(" "));
+    return t.includes("소계교원") || t.includes("소계(교원");
+  });
+  const staffSubtotalRow = findRowIndex(m, r => {
+    const t = norm(r.join(" "));
+    return t.includes("소계일반직") || t.includes("소계직원") || t.includes("소계(일반직") || t.includes("소계(직원");
+  });
+
+  // 4) 수당 헤더: 본봉 바로 다음 열부터 지급액계 바로 전 열까지.
   const headers = Array.from({ length: maxCols }, (_, c) => {
     const parts = [];
     for (let r = Math.max(0, headerIndex - 1); r <= Math.min(m.length - 1, headerIndex + 2); r++) parts.push(cell(r, c));
-    return norm(parts.join(" "));
+    return prettyHeader(parts.join(" "));
   });
-
   const allowanceCols = [];
   for (let c = baseCol + 1; c < totalCol; c++) {
-    const rawHeader = headers[c] || colNorm(c, Math.max(0, headerIndex - 1), Math.min(m.length, headerIndex + 3));
-    const h = prettyHeader(rawHeader || `열${c + 1}`);
+    const h = prettyHeader(headers[c] || colNorm(c, Math.max(0, headerIndex - 1), Math.min(m.length, headerIndex + 3)) || `열${c + 1}`);
     if (!h || isExcluded(h)) continue;
     allowanceCols.push({ index: c, name: h });
   }
 
+  // 5) 개별 데이터행 파싱. 실패하더라도 아래 소계행 파싱으로 보정합니다.
   const rows = [];
   let section = "teacher";
-  let dataStarted = false;
   for (let r = headerIndex + 1; r < m.length; r++) {
     const row = m[r] || [];
     const nt = rowNorm(r);
     if (!nt) continue;
-    if (nt.includes("소계교원") || nt.includes("소계(교원")) { section = "staff"; dataStarted = true; continue; }
-    if (nt.includes("소계직원") || nt.includes("소계일반직") || nt.includes("소계(직원") || nt.includes("소계(일반직") || nt.includes("합계교원일반직") || nt.includes("작성요령")) break;
+    if (nt.includes("소계교원") || nt.includes("소계(교원")) { section = "staff"; continue; }
+    if (nt.includes("소계직원") || nt.includes("소계일반직") || nt.includes("소계(직원") || nt.includes("소계(일반직") || nt.includes("합계교원") || nt.includes("작성요령")) break;
 
-    const job = String(row[jobCol] || "").trim();
-    const name = String(row[jobCol + 1] || "").trim();
+    const job = String(row[jobCol] ?? "").trim();
+    const name = String(row[jobCol + 1] ?? "").trim();
     const base = toNumber(row[baseCol]);
     const allowanceValues = allowanceCols.map(c => ({ name: c.name, amount: toNumber(row[c.index]) })).filter(x => x.amount > 0);
-    const hasMoney = base > 0 || allowanceValues.length > 0;
-    if (!job || !hasMoney) continue;
-    if (norm(job).includes("직명") || nt.includes("일련번호") || nt.includes("소계")) continue;
-    dataStarted = true;
+    const hasMoney = base > 0 || allowanceValues.length > 0 || toNumber(row[totalCol]) > 0;
+    const looksLikePerson = job && !norm(job).includes("직명") && !norm(job).includes("소계") && !norm(job).includes("합계") && !nt.includes("작성요령");
+    if (!looksLikePerson || !hasMoney) continue;
     rows.push({ rowNumber: r + 1, section, job, name, base, allowances: allowanceValues, total: toNumber(row[totalCol]) });
   }
 
-  if (!rows.length) {
-    const preview = m.slice(Math.max(0, headerIndex - 2), headerIndex + 10).map((row, i) => `${Math.max(0, headerIndex - 2) + i + 1}: ${row.map(v => String(v || "").replace(/\n/g, "/")).join(" | ")}`).join("\n");
-    throw new Error(`보수 시트(${sheet.name})에서 데이터 행을 찾지 못했습니다. 인식 열: 직명 ${jobCol + 1}, 본봉 ${baseCol + 1}, 지급액계 ${totalCol + 1}\n미리보기:\n${preview}`);
+  let summary = buildSalarySummary(rows, allowanceCols);
+
+  // 6) 소계행 보정: 금액은 소계행이 가장 신뢰도가 높습니다.
+  //    개별행을 브라우저가 놓쳐도 교원/직원 금액과 수당 합계가 0원이 되지 않게 합니다.
+  const teacherSub = teacherSubtotalRow >= 0 ? m[teacherSubtotalRow] || [] : null;
+  const staffSub = staffSubtotalRow >= 0 ? m[staffSubtotalRow] || [] : null;
+  const teacherRowsRange = rowsInRange(m, headerIndex + 1, teacherSubtotalRow >= 0 ? teacherSubtotalRow : staffSubtotalRow, jobCol, baseCol, totalCol);
+  const staffRowsRange = rowsInRange(m, (teacherSubtotalRow >= 0 ? teacherSubtotalRow + 1 : headerIndex + 1), staffSubtotalRow, jobCol, baseCol, totalCol);
+  const afterSchoolRowsRange = teacherRowsRange.filter(r => norm(r.job).includes("방과후"));
+  const regularTeacherRowsRange = teacherRowsRange.filter(r => !norm(r.job).includes("방과후"));
+
+  if (teacherSub) {
+    summary.teacherPayTotal.amount = toNumber(teacherSub[baseCol]);
+    summary.teacherPayTotal.people = teacherRowsRange.length || summary.teacherPayTotal.people;
+    // 세출예산의 교원급여 인원 검토는 원장+정교사 등 정규 교원 인원으로 봅니다.
+    summary.regularTeacherPay.people = regularTeacherRowsRange.length || summary.regularTeacherPay.people;
+    summary.regularTeacherPay.amount = regularTeacherRowsRange.reduce((a, r) => a + r.base, 0) || summary.regularTeacherPay.amount;
+    summary.afterSchoolPay.people = afterSchoolRowsRange.length || summary.afterSchoolPay.people;
+    summary.afterSchoolPay.amount = afterSchoolRowsRange.reduce((a, r) => a + r.base, 0) || summary.afterSchoolPay.amount;
+    summary.teacherAllowances = allowanceCols.map(c => ({ name: c.name, amount: toNumber(teacherSub[c.index]) })).filter(x => x.amount > 0 && !isExcluded(x.name));
+  }
+  if (staffSub) {
+    summary.staffPay.amount = toNumber(staffSub[baseCol]);
+    summary.staffPay.people = staffRowsRange.length || summary.staffPay.people;
+    summary.staffAllowances = allowanceCols.map(c => ({ name: c.name, amount: toNumber(staffSub[c.index]) })).filter(x => x.amount > 0 && !isExcluded(x.name));
   }
 
-  const summary = buildSalarySummary(rows, allowanceCols);
-  summary.detectedColumns = { jobCol: jobCol + 1, baseCol: baseCol + 1, totalCol: totalCol + 1, headerRow: headerIndex + 1 };
+  // 7) 개별행이 전혀 없어도 소계행이 있으면 진행합니다.
+  if (!rows.length && !teacherSub && !staffSub) {
+    const preview = m.slice(Math.max(0, headerIndex - 2), headerIndex + 14).map((row, i) => `${Math.max(0, headerIndex - 2) + i + 1}: ${row.map(v => String(v || "").replace(/\n/g, "/")).join(" | ")}`).join("\n");
+    throw new Error(`보수 시트(${sheet.name})에서 데이터 행과 소계행을 찾지 못했습니다. 인식 열: 직명 ${jobCol + 1}, 본봉 ${baseCol + 1}, 지급액계 ${totalCol + 1}\n미리보기:\n${preview}`);
+  }
+
+  summary.rows = rows.length ? rows : [...teacherRowsRange, ...staffRowsRange];
+  summary.teachers = rows.length ? summary.teachers : teacherRowsRange;
+  summary.regularTeachers = rows.length ? summary.regularTeachers : regularTeacherRowsRange;
+  summary.afterSchoolTeachers = rows.length ? summary.afterSchoolTeachers : afterSchoolRowsRange;
+  summary.staff = rows.length ? summary.staff : staffRowsRange;
+  summary.detectedColumns = {
+    jobCol: jobCol + 1,
+    baseCol: baseCol + 1,
+    totalCol: totalCol + 1,
+    headerRow: headerIndex + 1,
+    teacherSubtotalRow: teacherSubtotalRow >= 0 ? teacherSubtotalRow + 1 : "없음",
+    staffSubtotalRow: staffSubtotalRow >= 0 ? staffSubtotalRow + 1 : "없음"
+  };
   return summary;
 }
 
-function prettyHeader(h) {
-  return String(h || "")
-    .replace(/[\n\r]/g, "")
-    .replace(/\([A-Z]\)/g, "")
-    .replace(/[A-Z]\)?/g, "")
-    .replace(/[()=~]/g, " ")
-    .replace(/\s+/g, "")
-    .trim();
+function findRowIndex(matrix, predicate) {
+  for (let i = 0; i < matrix.length; i++) if (predicate(matrix[i] || [])) return i;
+  return -1;
 }
 
-function buildSalarySummary(rows, allowanceCols) {
-  const teachers = rows.filter(r => r.section === "teacher");
-  const regularTeachers = teachers.filter(r => !norm(r.job).includes("방과후"));
-  const afterSchoolTeachers = teachers.filter(r => norm(r.job).includes("방과후"));
-  const staff = rows.filter(r => r.section === "staff");
-  const sumBase = arr => arr.reduce((a, r) => a + r.base, 0);
-  const collect = arr => {
-    const map = new Map();
-    arr.forEach(r => r.allowances.forEach(x => map.set(x.name, (map.get(x.name) || 0) + x.amount)));
-    return [...map.entries()].map(([name, amount]) => ({ name, amount })).filter(x => x.amount > 0);
-  };
-  return {
-    rows,
-    teachers,
-    regularTeachers,
-    afterSchoolTeachers,
-    staff,
-    regularTeacherPay: { amount: sumBase(regularTeachers), people: regularTeachers.filter(r => r.base > 0).length },
-    afterSchoolPay: { amount: sumBase(afterSchoolTeachers), people: afterSchoolTeachers.filter(r => r.base > 0).length },
-    teacherPayTotal: { amount: sumBase(teachers), people: teachers.filter(r => r.base > 0).length },
-    staffPay: { amount: sumBase(staff), people: staff.filter(r => r.base > 0).length },
-    teacherAllowances: collect(teachers),
-    regularTeacherAllowances: collect(regularTeachers),
-    staffAllowances: collect(staff),
-    allowanceHeaders: allowanceCols.map(c => c.name)
-  };
+function rowsInRange(matrix, start, end, jobCol, baseCol, totalCol) {
+  if (end < 0 || start < 0 || start >= end) return [];
+  const out = [];
+  for (let r = start; r < end; r++) {
+    const row = matrix[r] || [];
+    const job = String(row[jobCol] ?? "").trim();
+    const nt = norm(row.join(" "));
+    if (!job || nt.includes("직명") || nt.includes("소계") || nt.includes("합계") || nt.includes("작성요령")) continue;
+    const base = toNumber(row[baseCol]);
+    const total = toNumber(row[totalCol]);
+    // 금액 셀이 비어 있어도 직명 패턴이 명확하면 인원수 산정에는 포함합니다.
+    if (base > 0 || total > 0 || /원장|교사|실장|사무|조리|영양|보조|돌봄|기사|차량|미화/.test(job)) {
+      out.push({ rowNumber: r + 1, section: "range", job, name: String(row[jobCol + 1] ?? "").trim(), base, allowances: [], total });
+    }
+  }
+  return out;
 }
 
 function parseRetirement(sheets) {
