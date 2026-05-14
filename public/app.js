@@ -1,4 +1,4 @@
-/* global XLSX, pdfjsLib */
+/* global XLSX, pdfjsLib, JSZip */
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
 const $ = (id) => document.getElementById(id);
@@ -53,8 +53,9 @@ $('downloadBtn').addEventListener('click', () => {
 });
 
 async function parseExcel(file){
-  const buf = await file.arrayBuffer();
-  const wb = XLSX.read(buf, { type:'array', cellDates:false, cellNF:false, cellText:true, raw:false, WTF:false });
+  const originalBuf = await file.arrayBuffer();
+  const normalizedBuf = await normalizeXlsxForSheetJS(originalBuf);
+  const wb = XLSX.read(normalizedBuf, { type:'array', cellDates:false, cellNF:false, cellText:true, raw:false, WTF:false });
   const sheetMeta = (wb.Workbook && wb.Workbook.Sheets) || [];
   const visible = wb.SheetNames.map((name,i)=>({name, hidden: sheetMeta[i]?.Hidden || 0})).filter(s=>!s.hidden);
   const candidates = visible.map(s=>({ ...s, score: sheetScore(s.name) })).filter(s=>s.score>0).sort((a,b)=>b.score-a.score);
@@ -70,6 +71,34 @@ async function parseExcel(file){
   const retireSheets = visible.filter(s=>RETIRE_RE.test(s.name)).map(s=>parseRetireSheet(s.name, XLSX.utils.sheet_to_json(wb.Sheets[s.name], {header:1, raw:false, defval:''})));
   return { fileName:file.name, visibleSheets:visible.map(s=>s.name), salaryCandidates:tried, salary, retirement:retireSheets };
 }
+
+async function normalizeXlsxForSheetJS(buf){
+  // 일부 예산서 파일은 엑셀 XML 태그가 <x:worksheet>, <x:c>처럼 접두어가 붙어 저장됩니다.
+  // SheetJS 0.18.x가 이 형식을 빈 시트로 읽는 경우가 있어, 브라우저 안에서만 표준 형태로 정규화합니다.
+  if(typeof JSZip === 'undefined') return buf;
+  try{
+    const zip = await JSZip.loadAsync(buf);
+    const xmlFiles = Object.keys(zip.files).filter(p => /(^xl\/.*\.xml$)|(^xl\/_rels\/.*\.rels$)|(^_rels\/.*\.rels$)/.test(p));
+    let changed = false;
+    for(const path of xmlFiles){
+      const file = zip.file(path);
+      if(!file) continue;
+      let xml = await file.async('string');
+      const before = xml;
+      // x: 접두어만 제거합니다. r:, mc:, a: 등 관계/드로잉 접두어는 유지합니다.
+      xml = xml.replace(/<\/?x:/g, m => m.replace('x:', ''));
+      xml = xml.replace(/\sxmlns:x="http:\/\/schemas\.openxmlformats\.org\/spreadsheetml\/2006\/main"/g,
+                        ' xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"');
+      if(xml !== before){ zip.file(path, xml); changed = true; }
+    }
+    if(!changed) return buf;
+    return await zip.generateAsync({type:'arraybuffer', compression:'DEFLATE'});
+  }catch(e){
+    console.warn('XLSX namespace normalization skipped:', e);
+    return buf;
+  }
+}
+
 function sheetScore(name){
   let score = 0; const n = norm(name);
   if(/교직원보수일람표/.test(n)) score += 100;
