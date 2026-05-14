@@ -129,152 +129,130 @@ async function parsePdf(file) {
   return { pages, fullText, compactText: norm(fullText) };
 }
 
+
 function analyze(excel, pdf) {
   const results = [];
   const debug = [];
-  const salaryRows = excel.salaryRows;
 
   debug.push(`선택된 보수 시트: ${excel.salarySheet?.name || "확인 불가"}`);
-  debug.push(`보수 행 후보: ${salaryRows.length}건`);
   debug.push(`퇴직 관련 시트 후보: ${excel.retirementSheets.map(s => s.name).join(", ") || "없음"}`);
 
-  const groups = buildExcelGroups(salaryRows);
-  const pdfItems = extractPdfItems(pdf.fullText);
-  debug.push(`PDF 산출기초 후보: ${pdfItems.length}건`);
+  const salaryModel = buildSalaryModel(excel.salarySheet?.matrix || []);
+  const pdfModel = buildPdfModel(pdf);
 
-  comparePay(results, "교원급여", groups.teacherPay, findPdfAmount(pdf, RULES.pdfBudgetItems.teacherPay), findPdfPeopleNear(pdf, RULES.pdfBudgetItems.teacherPay), true);
-  comparePay(results, "방과후교원급여", groups.afterSchoolTeacherPay, findPdfAmount(pdf, RULES.pdfBudgetItems.afterSchoolTeacherPay), findPdfPeopleNear(pdf, RULES.pdfBudgetItems.afterSchoolTeacherPay), true);
-  comparePay(results, "직원급여", groups.staffPay, findPdfAmount(pdf, RULES.pdfBudgetItems.staffPay), findPdfPeopleNear(pdf, RULES.pdfBudgetItems.staffPay), false);
+  debug.push(`교원 구간: ${salaryModel.teacherRows.length}행`);
+  debug.push(`직원 구간: ${salaryModel.staffRows.length}행`);
+  debug.push(`수당 열: ${salaryModel.allowanceHeaders.map(h => h.name).join(", ") || "없음"}`);
+  debug.push(`자가운전보조금 합계: ${fmt(salaryModel.selfDrivingAllowance)}원`);
 
-  checkAllowances(results, groups.teacherAllowances, pdf, "교원수당");
-  checkAllowances(results, groups.staffAllowances, pdf, "직원수당");
-  checkRetirement(results, excel, pdf);
-  checkMisclassifiedPersonnel(results, pdf);
+  checkSelfDrivingAllowance(results, salaryModel, pdfModel);
+  checkVehicleDriverMisclassification(results, pdfModel);
+  checkRetirementFocused(results, excel, pdfModel);
 
-  return { results, debug: debug.concat(buildDebug(groups, pdfItems)) };
+  return { results, debug };
 }
 
-function buildExcelGroups(rows) {
-  const sumByHeaders = (filterFn, headerFn) => {
-    let amount = 0, people = 0;
-    rows.filter(filterFn).forEach(row => {
-      const rowSum = Object.entries(row.amounts).reduce((a, [h, v]) => a + (headerFn(h) ? v : 0), 0);
-      if (rowSum > 0) { amount += rowSum; people++; }
+function buildSalaryModel(matrix) {
+  const headerRowIndex = matrix.findIndex(row => row.some(c => norm(c).includes("직명")) && row.some(c => hasAny(c, ["본봉", "기본급"])));
+  const headerRow1 = headerRowIndex >= 0 ? matrix[headerRowIndex] : [];
+  const headerRow2 = headerRowIndex >= 0 ? matrix[headerRowIndex + 1] || [] : [];
+  const maxCols = Math.max(headerRow1.length, headerRow2.length, ...matrix.map(r => r.length));
+  const headers = Array.from({ length: maxCols }, (_, i) => ({
+    index: i,
+    name: String([headerRow1[i], headerRow2[i]].filter(Boolean).join(" ")).replace(/\s+/g, " ").trim()
+  }));
+
+  const baseCol = headers.find(h => hasAny(h.name, ["본봉", "기본급"]))?.index ?? -1;
+  const payTotalCol = headers.find(h => norm(h.name).includes("지급액계"))?.index ?? -1;
+  const allowanceHeaders = headers.filter(h => baseCol >= 0 && payTotalCol >= 0 && h.index > baseCol && h.index < payTotalCol && h.name);
+
+  const teacherSubtotal = matrix.findIndex(row => row.some(c => /소계\s*\(\s*교원\s*\)/.test(String(c))));
+  const staffSubtotal = matrix.findIndex(row => row.some(c => /소계\s*\(\s*(직원|일반직)\s*\)/.test(String(c))));
+  const dataStart = headerRowIndex >= 0 ? headerRowIndex + 2 : 0;
+
+  const teacherRows = teacherSubtotal >= 0 ? matrix.slice(dataStart, teacherSubtotal).filter(isRealSalaryRow) : [];
+  const staffRows = teacherSubtotal >= 0 && staffSubtotal >= 0 ? matrix.slice(teacherSubtotal + 1, staffSubtotal).filter(isRealSalaryRow) : [];
+  const allRows = teacherRows.concat(staffRows);
+
+  const selfDrivingCols = allowanceHeaders.filter(h => hasAny(h.name, ["자가운전", "자가 운전"]));
+  const selfDrivingAllowance = sumRowsByColumns(allRows, selfDrivingCols.map(h => h.index));
+  const teacherSelfDrivingAllowance = sumRowsByColumns(teacherRows, selfDrivingCols.map(h => h.index));
+  const staffSelfDrivingAllowance = sumRowsByColumns(staffRows, selfDrivingCols.map(h => h.index));
+
+  return { headerRowIndex, headers, baseCol, payTotalCol, allowanceHeaders, teacherRows, staffRows, selfDrivingAllowance, teacherSelfDrivingAllowance, staffSelfDrivingAllowance };
+}
+
+function isRealSalaryRow(row) {
+  const first = String(row[0] ?? "").trim();
+  const job = String(row[1] ?? "").trim();
+  return !!job && !/소계|합계|작성요령/.test(first + job);
+}
+
+function sumRowsByColumns(rows, cols) {
+  return rows.reduce((sum, row) => sum + cols.reduce((a, c) => a + toNumber(row[c]), 0), 0);
+}
+
+function buildPdfModel(pdf) {
+  const fullText = pdf.fullText;
+  const compactText = norm(fullText);
+  return { fullText, compactText, lines: fullText.split(/\n+/).map(s => s.trim()).filter(Boolean) };
+}
+
+function checkSelfDrivingAllowance(results, salaryModel, pdfModel) {
+  if (salaryModel.selfDrivingAllowance <= 0) return;
+  const hasPdfSelfDriving = hasAny(pdfModel.fullText, ["자가운전보조금", "자가 운전 보조금", "자가운전"]);
+  if (!hasPdfSelfDriving) {
+    const detail = [];
+    if (salaryModel.teacherSelfDrivingAllowance > 0) detail.push(`교원 ${fmt(salaryModel.teacherSelfDrivingAllowance)}원`);
+    if (salaryModel.staffSelfDrivingAllowance > 0) detail.push(`직원 ${fmt(salaryModel.staffSelfDrivingAllowance)}원`);
+    results.push({
+      category: "미편성",
+      item: "자가운전보조금",
+      excelAmount: salaryModel.selfDrivingAllowance,
+      pdfAmount: 0,
+      status: "bad",
+      message: `자가운전보조금 예산 미편성${detail.length ? ` (${detail.join(" + ")} = ${fmt(salaryModel.selfDrivingAllowance)}원)` : ""}`
     });
-    return { amount, people };
-  };
-  const isRegularTeacher = r => hasAny(r.rowText, RULES.regularTeacherKeywords) && !hasAny(r.rowText, ["방과후"]);
-  const isAfterSchool = r => hasAny(r.rowText, RULES.afterSchoolKeywords);
-  const isStaff = r => hasAny(r.rowText, RULES.staffKeywords) && !hasAny(r.rowText, RULES.teacherKeywords);
-  const isBase = h => hasAny(h, RULES.basePayHeaders);
-  const isAllowance = h => hasAny(h, RULES.allowanceHeaders) && !isBase(h);
-  return {
-    teacherPay: sumByHeaders(isRegularTeacher, isBase),
-    afterSchoolTeacherPay: sumByHeaders(isAfterSchool, isBase),
-    staffPay: sumByHeaders(isStaff, isBase),
-    teacherAllowances: collectAllowances(rows.filter(isRegularTeacher), isAllowance),
-    staffAllowances: collectAllowances(rows.filter(isStaff), isAllowance)
-  };
+  }
 }
 
-function collectAllowances(rows, headerFn) {
-  const map = new Map();
-  rows.forEach(row => {
-    Object.entries(row.amounts).forEach(([header, value]) => {
-      if (value > 0 && headerFn(header)) map.set(header, (map.get(header) || 0) + value);
+function checkVehicleDriverMisclassification(results, pdfModel) {
+  const compact = pdfModel.compactText;
+  const start = compact.indexOf(norm("통학차량이용비"));
+  if (start < 0) return;
+  const endCandidates = ["특별급식비간식비", "적립금", "시설설비비품비"].map(k => compact.indexOf(norm(k), start + 1)).filter(i => i > start);
+  const end = endCandidates.length ? Math.min(...endCandidates) : start + 1200;
+  const section = compact.slice(start, end);
+  const m = section.match(/차량기사급여.*?=([0-9,]+)원?/);
+  if (m) {
+    const amount = toNumber(m[1]);
+    results.push({
+      category: "오편성",
+      item: "차량기사급여",
+      excelAmount: null,
+      pdfAmount: amount,
+      status: "bad",
+      message: `차량기사급여 ${fmt(amount)}원을 통학차량이용비의 산출내역에 편성`
     });
+  }
+}
+
+function checkRetirementFocused(results, excel, pdfModel) {
+  const hasRetirementSheetAmount = excel.retirementSheets.some(s => {
+    const text = norm(s.name + " " + s.text);
+    if (!text.includes("퇴직")) return false;
+    return s.matrix.flat().some(c => toNumber(c) > 0);
   });
-  return [...map.entries()].map(([name, amount]) => ({ name, amount }));
-}
-
-function extractPdfItems(text) {
-  const lines = text.split(/\n+/).map(s => s.trim()).filter(Boolean);
-  return lines.filter(line => /원\s*\*/.test(line) || /=\s*[0-9,]+/.test(line));
-}
-
-function findPdfAmount(pdf, aliases) {
-  for (const alias of aliases) {
-    const idx = pdf.compactText.indexOf(norm(alias));
-    if (idx < 0) continue;
-    const slice = pdf.compactText.slice(idx, idx + 260);
-    const formulaMatch = slice.match(/=([0-9,]+)원?/);
-    if (formulaMatch) return toNumber(formulaMatch[1]);
-    const tableMatch = slice.match(new RegExp(`${norm(alias)}([0-9,]{1,12})`));
-    if (tableMatch) return toNumber(tableMatch[1]) * 1000;
+  if (!hasRetirementSheetAmount) {
+    results.push({ category: "퇴직금", item: "퇴직적립금", status: "warn", message: "퇴직 관련 시트의 적립금액을 자동 확인하지 못했습니다.", excelAmount: null, pdfAmount: null });
+    return;
   }
-  return 0;
-}
-
-function findPdfPeopleNear(pdf, aliases) {
-  for (const alias of aliases) {
-    const idx = pdf.compactText.indexOf(norm(alias));
-    if (idx < 0) continue;
-    const slice = pdf.compactText.slice(idx, idx + 220);
-    const matches = [...slice.matchAll(/\*([0-9]+)명\*/g)].map(m => Number(m[1]));
-    if (matches.length) return matches.reduce((a, b) => a + b, 0);
-  }
-  return 0;
-}
-
-function comparePay(results, label, excelGroup, pdfAmount, pdfPeople, checkPeople) {
-  const amountDiff = excelGroup.amount - pdfAmount;
-  const peopleDiff = excelGroup.people - pdfPeople;
-  let status = "ok", message = "금액 일치";
-  if (excelGroup.amount === 0 && pdfAmount === 0) {
-    status = "warn"; message = "자동 추출 실패 또는 항목 없음";
-  } else if (Math.abs(amountDiff) > 1000) {
-    status = "bad"; message = `금액 차이 ${fmt(amountDiff)}원`;
-  }
-  if (checkPeople && pdfPeople > 0 && peopleDiff !== 0) {
-    status = "bad";
-    message += ` / 인원수 불일치: PDF ${pdfPeople}명, 엑셀 ${excelGroup.people}명`;
-  }
-  results.push({ category: "보수", item: label, excelAmount: excelGroup.amount, pdfAmount, excelPeople: excelGroup.people, pdfPeople, status, message });
-}
-
-function checkAllowances(results, allowances, pdf, bucketName) {
-  const missing = [];
-  const direct = [];
-  allowances.forEach(a => {
-    const amount = findPdfAmount(pdf, [a.name]);
-    if (amount > 0 && Math.abs(amount - a.amount) <= 1000) direct.push({ ...a, pdfAmount: amount });
-    else missing.push(a);
-  });
-  direct.forEach(a => results.push({ category: "수당", item: a.name, excelAmount: a.amount, pdfAmount: a.pdfAmount, status: "ok", message: "개별 편성 일치" }));
-
-  const missingSum = missing.reduce((a, b) => a + b.amount, 0);
-  if (missing.length === 0) return;
-  const bucketAmount = findPdfAmount(pdf, [bucketName]);
-  if (bucketAmount && Math.abs(bucketAmount - missingSum) <= 1000) {
-    results.push({ category: "수당", item: bucketName, excelAmount: missingSum, pdfAmount: bucketAmount, status: "info", message: `통합편성(${missing.map(x => `${x.name} ${fmt(x.amount)}원`).join(" + ")} = ${fmt(missingSum)}원)` });
+  const hasPdfRetirement = hasAny(pdfModel.fullText, ["퇴직금", "퇴직적립", "퇴직 급여", "퇴직급여", "퇴직충당", "퇴직 충당"]);
+  if (!hasPdfRetirement) {
+    results.push({ category: "미편성", item: "퇴직적립금", status: "bad", message: "퇴직적립금 미편성", excelAmount: null, pdfAmount: 0 });
   } else {
-    results.push({ category: "수당", item: bucketName, excelAmount: missingSum, pdfAmount: bucketAmount, status: "warn", message: `추가확인필요: PDF에서 개별 확인되지 않은 수당 ${missing.length}건의 합계와 ${bucketName} 금액이 일치하지 않습니다.` });
+    results.push({ category: "퇴직금", item: "퇴직적립금", status: "ok", message: "퇴직 관련 편성 항목 확인", excelAmount: null, pdfAmount: null });
   }
-}
-
-function checkRetirement(results, excel, pdf) {
-  const hasRetirementAmount = excel.retirementSheets.some(s => s.matrix.flat().some(c => toNumber(c) > 0));
-  if (!hasRetirementAmount) return;
-  const found = hasAny(pdf.fullText, RULES.pdfBudgetItems.retirement);
-  results.push({ category: "퇴직금", item: "퇴직적립금 편성 여부", status: found ? "ok" : "bad", message: found ? "퇴직 관련 편성 항목 확인" : "퇴직금 적립금 미편성 의심", excelAmount: null, pdfAmount: null });
-}
-
-function checkMisclassifiedPersonnel(results, pdf) {
-  const lines = pdf.fullText.split(/\n+/).map(s => s.trim()).filter(Boolean);
-  let currentBucket = "";
-  const suspicious = [];
-  for (const line of lines) {
-    if (/인건비|급식비|통학차량|교육활동|운영비|시설비|적립금/.test(line) && !/=/.test(line)) currentBucket = line;
-    const isPersonnel = hasAny(line, RULES.personnelExpenseKeywords) || /기사급여|영양사|조리.*급여/.test(line);
-    const allowed = hasAny(currentBucket, RULES.allowedPersonnelBuckets);
-    if (isPersonnel && currentBucket && !allowed && !/세출합계|발행일/.test(line)) {
-      const location = currentBucket.replace(/\s+/g, " ");
-      const item = line.replace(/\s+/g, " ");
-      suspicious.push({ item, location });
-    }
-  }
-  const unique = Array.from(new Map(suspicious.map(x => [`${x.item}-${x.location}`, x])).values()).slice(0, 20);
-  unique.forEach(x => results.push({ category: "오편성", item: x.item, status: "bad", message: `${x.item}를 ${x.location}에 편성`, excelAmount: null, pdfAmount: null }));
 }
 
 function hasAny(text, keywords) {
@@ -283,16 +261,7 @@ function hasAny(text, keywords) {
 }
 
 function buildDebug(groups, pdfItems) {
-  return [
-    "\n[엑셀 자동 집계]",
-    `교원급여: ${fmt(groups.teacherPay.amount)}원 / ${groups.teacherPay.people}명`,
-    `방과후교원급여: ${fmt(groups.afterSchoolTeacherPay.amount)}원 / ${groups.afterSchoolTeacherPay.people}명`,
-    `직원급여: ${fmt(groups.staffPay.amount)}원 / ${groups.staffPay.people}명`,
-    `교원수당 후보: ${groups.teacherAllowances.map(a => `${a.name}=${fmt(a.amount)}`).join(", ") || "없음"}`,
-    `직원수당 후보: ${groups.staffAllowances.map(a => `${a.name}=${fmt(a.amount)}`).join(", ") || "없음"}`,
-    "\n[PDF 산출기초 후보 일부]",
-    pdfItems.slice(0, 40).join("\n")
-  ];
+  return [];
 }
 
 function renderReport(report) {
