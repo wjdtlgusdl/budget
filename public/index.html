@@ -1,1 +1,21 @@
-<!doctype html><html><body><h1>Budget Review App v21</h1></body></html>
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>예산서 검토 앱</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+<div class="wrap">
+<h1>예산서 검토 앱</h1>
+<input type="file" id="excel" accept=".xlsx,.xls">
+<input type="file" id="pdf" accept=".pdf">
+<button id="runBtn">검토 실행</button>
+<pre id="debug"></pre>
+<div id="results"></div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
