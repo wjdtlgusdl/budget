@@ -59,7 +59,7 @@ async function parseExcel(file) {
   const visibility = Object.fromEntries((wb.Workbook?.Sheets || []).map((s, i) => [wb.SheetNames[i], s.Hidden || 0]));
   const sheets = wb.SheetNames.map(name => {
     const ws = wb.Sheets[name];
-    const matrix = ws ? XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: true }) : [];
+    const matrix = ws ? worksheetToMatrix(ws) : [];
     return { name, hidden: visibility[name] || 0, matrix, text: matrix.flat().map(String).join(" ") };
   });
   const salaryCandidates = sheets
@@ -75,58 +75,106 @@ async function parseExcel(file) {
   return { sheets, salarySheet, salary, retirement, salaryCandidates };
 }
 
+
+function worksheetToMatrix(ws) {
+  if (!ws || !ws["!ref"]) return [];
+  const range = XLSX.utils.decode_range(ws["!ref"]);
+  const matrix = [];
+  for (let r = range.s.r; r <= range.e.r; r++) {
+    const row = [];
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const addr = XLSX.utils.encode_cell({ r, c });
+      const cell = ws[addr];
+      let v = "";
+      if (cell) {
+        if (cell.v !== undefined && cell.v !== null) v = cell.v;
+        else if (cell.w !== undefined && cell.w !== null) v = cell.w;
+        else if (cell.f && cell.v !== undefined) v = cell.v;
+      }
+      row.push(v);
+    }
+    matrix.push(row);
+  }
+  return matrix;
+}
+
 function scoreSalarySheet(sheet) {
   let score = 0;
   const name = norm(sheet.name);
-  CONFIG.salarySheetNameKeywords.forEach(k => { if (name.includes(norm(k))) score += 5; });
   const t = norm(sheet.text);
-  ["직명", "본봉", "기본급", "지급액계", "소계(교원", "소계(일반직", "소계(직원"].forEach(k => { if (t.includes(norm(k))) score += 10; });
+
+  // 보이는 시트만 후보가 되며, 같은 양식의 월/년 시트가 함께 있을 때는
+  // 반드시 연간 기준 시트를 우선합니다.
+  // 예: 교직원보수일람표(년) > 교직원보수일람표 > 교직원보수일람표(월)
+  if (name.includes("교직원보수일람표")) score += 80;
+  if (name.includes("보수일람표")) score += 60;
+  if (name.includes("보수") || name.includes("급여") || name.includes("봉급") || name.includes("인건비") || name.includes("교직원")) score += 20;
+  if (name.includes("년") || name.includes("연간") || name.includes("연")) score += 100;
+  if (name.includes("월") || name.includes("월급여") || name.includes("매월")) score -= 100;
+
+  ["직명", "본봉", "기본급", "지급액계", "소계교원", "소계일반직", "소계직원"].forEach(k => {
+    if (t.includes(norm(k))) score += 10;
+  });
+
+  // 숨김 월급여/보조 계산 시트가 우연히 후보가 되지 않도록 감점합니다.
+  if (name === "월급여" || name.includes("비월정수당")) score -= 200;
   return score;
 }
 
 function parseSalarySheet(sheet) {
   const m = sheet.matrix || [];
   const maxCols = Math.max(...m.map(r => r.length), 0);
-
-  // 헤더 탐색을 “같은 행 텍스트”에 의존하지 않습니다.
-  // 병합셀/줄바꿈/2단 헤더 때문에 직명·본봉·지급액계가 서로 다른 행에 걸쳐 있어도
-  // 상단 30행에서 각 열을 독립적으로 찾아냅니다.
-  const scanRows = Math.min(30, m.length);
-  const colText = (c, r1 = 0, r2 = scanRows) => {
+  const scanRows = Math.min(40, m.length);
+  const cell = (r, c) => String((m[r] || [])[c] ?? "");
+  const cellNorm = (r, c) => norm(cell(r, c));
+  const rowNorm = (r) => norm((m[r] || []).join(" "));
+  const colNorm = (c, r1 = 0, r2 = scanRows) => {
     const parts = [];
-    for (let r = r1; r < r2; r++) parts.push(String((m[r] || [])[c] ?? ""));
+    for (let r = r1; r < Math.min(r2, m.length); r++) parts.push(cell(r, c));
     return norm(parts.join(" "));
   };
-  const cellText = (r, c) => norm(String((m[r] || [])[c] ?? ""));
 
-  let jobCol = -1, baseCol = -1, totalCol = -1;
-  let headerIndex = -1;
+  let jobCol = -1, baseCol = -1, totalCol = -1, headerIndex = -1;
 
-  // 1) 셀 단위로 가장 확실한 위치 찾기
+  // 1) 상단 셀 단위 탐색. 줄바꿈/괄호/영문기호는 norm()이 제거합니다.
   for (let r = 0; r < scanRows; r++) {
     for (let c = 0; c < maxCols; c++) {
-      const t = cellText(r, c);
+      const t = cellNorm(r, c);
       if (jobCol < 0 && t.includes("직명")) { jobCol = c; headerIndex = Math.max(headerIndex, r); }
       if (baseCol < 0 && (t.includes("본봉") || t.includes("기본급"))) { baseCol = c; headerIndex = Math.max(headerIndex, r); }
       if (totalCol < 0 && t.includes("지급액계")) { totalCol = c; headerIndex = Math.max(headerIndex, r); }
     }
   }
 
-  // 2) 그래도 못 찾으면 열 전체 상단 텍스트로 찾기
+  // 2) 열 단위 탐색. 병합셀 또는 2단 헤더 보정.
   for (let c = 0; c < maxCols; c++) {
-    const t = colText(c);
+    const t = colNorm(c);
     if (jobCol < 0 && t.includes("직명")) jobCol = c;
     if (baseCol < 0 && (t.includes("본봉") || t.includes("기본급"))) baseCol = c;
     if (totalCol < 0 && t.includes("지급액계")) totalCol = c;
   }
 
-  // 3) 사용자 예시 양식의 고정 패턴 보정: 직명=B, 본봉=E, 지급액계=Q
-  //    단, 해당 열 근처에 관련 단어가 실제로 있을 때만 보정합니다.
-  const upperText = norm(m.slice(0, scanRows).flat().join(" "));
-  if ((jobCol < 0 || baseCol < 0 || totalCol < 0) && upperText.includes("교직원보수일람표")) {
-    if (jobCol < 0 && colText(1).includes("직명")) jobCol = 1;
-    if (baseCol < 0 && (colText(4).includes("본봉") || colText(4).includes("기본급"))) baseCol = 4;
-    if (totalCol < 0 && colText(16).includes("지급액계")) totalCol = 16;
+  // 3) 교직원보수일람표 표준 양식 보정: B=직명, E=본봉, Q=지급액계.
+  //    실제 예시처럼 XLSX 라이브러리가 헤더 텍스트를 일부 놓치는 경우에도 중단하지 않습니다.
+  const titleText = norm(m.slice(0, scanRows).flat().join(" ") + " " + sheet.name);
+  if (titleText.includes("교직원보수일람표") || titleText.includes("보수일람표") || titleText.includes("교직원보수")) {
+    if (jobCol < 0) jobCol = 1;
+    if (baseCol < 0) baseCol = 4;
+    if (totalCol < 0) totalCol = 16;
+  }
+
+  // 4) 여전히 못 찾은 경우: 상단 20행에서 숫자 데이터 패턴으로 보정.
+  //    직명열은 문자열, 본봉열은 큰 금액, 지급액계는 본봉보다 큰 금액이 반복되는 열입니다.
+  if (jobCol < 0 || baseCol < 0 || totalCol < 0) {
+    for (let c = 0; c < maxCols; c++) {
+      const sampleVals = [];
+      for (let r = 0; r < Math.min(m.length, 80); r++) sampleVals.push(cell(r, c));
+      const txtCount = sampleVals.filter(v => /원장|교사|직원|기사|조리|방과후|미화|보조/.test(String(v))).length;
+      const moneyCount = sampleVals.filter(v => toNumber(v) >= 1000000).length;
+      if (jobCol < 0 && txtCount >= 3) jobCol = c;
+      if (baseCol < 0 && moneyCount >= 5) baseCol = c;
+    }
+    if (totalCol < 0 && baseCol >= 0) totalCol = Math.min(maxCols - 1, baseCol + 12);
   }
 
   if (jobCol < 0 || baseCol < 0 || totalCol < 0) {
@@ -134,23 +182,23 @@ function parseSalarySheet(sheet) {
     throw new Error(`보수 시트 후보(${sheet.name})에서 직명/본봉/지급액계 헤더를 찾지 못했습니다.\n상단 미리보기:\n${preview}`);
   }
 
-  // 데이터 시작행: 직명 헤더가 있는 행 이후부터
+  // 헤더 행은 직명 셀이 있는 행, 없으면 본봉/지급액계가 가장 가까운 행, 그래도 없으면 표준 양식 5행(0-index 4)
   for (let r = 0; r < scanRows; r++) {
-    if (cellText(r, jobCol).includes("직명")) { headerIndex = r; break; }
+    if (cellNorm(r, jobCol).includes("직명") || cellNorm(r, baseCol).includes("본봉") || cellNorm(r, totalCol).includes("지급액계")) {
+      headerIndex = r; break;
+    }
   }
-  if (headerIndex < 0) headerIndex = 0;
+  if (headerIndex < 0) headerIndex = 4;
 
   const headers = Array.from({ length: maxCols }, (_, c) => {
     const parts = [];
-    for (let r = Math.max(0, headerIndex - 1); r <= Math.min(m.length - 1, headerIndex + 2); r++) {
-      parts.push(String((m[r] || [])[c] || ""));
-    }
+    for (let r = Math.max(0, headerIndex - 1); r <= Math.min(m.length - 1, headerIndex + 2); r++) parts.push(cell(r, c));
     return norm(parts.join(" "));
   });
 
   const allowanceCols = [];
   for (let c = baseCol + 1; c < totalCol; c++) {
-    const rawHeader = headers[c] || colText(c, Math.max(0, headerIndex - 1), Math.min(m.length, headerIndex + 3));
+    const rawHeader = headers[c] || colNorm(c, Math.max(0, headerIndex - 1), Math.min(m.length, headerIndex + 3));
     const h = prettyHeader(rawHeader || `열${c + 1}`);
     if (!h || isExcluded(h)) continue;
     allowanceCols.push({ index: c, name: h });
@@ -158,12 +206,12 @@ function parseSalarySheet(sheet) {
 
   const rows = [];
   let section = "teacher";
+  let dataStarted = false;
   for (let r = headerIndex + 1; r < m.length; r++) {
     const row = m[r] || [];
-    const text = row.map(String).join(" ");
-    const nt = norm(text);
+    const nt = rowNorm(r);
     if (!nt) continue;
-    if (nt.includes("소계교원") || nt.includes("소계(교원")) { section = "staff"; continue; }
+    if (nt.includes("소계교원") || nt.includes("소계(교원")) { section = "staff"; dataStarted = true; continue; }
     if (nt.includes("소계직원") || nt.includes("소계일반직") || nt.includes("소계(직원") || nt.includes("소계(일반직") || nt.includes("합계교원일반직") || nt.includes("작성요령")) break;
 
     const job = String(row[jobCol] || "").trim();
@@ -171,18 +219,30 @@ function parseSalarySheet(sheet) {
     const base = toNumber(row[baseCol]);
     const allowanceValues = allowanceCols.map(c => ({ name: c.name, amount: toNumber(row[c.index]) })).filter(x => x.amount > 0);
     const hasMoney = base > 0 || allowanceValues.length > 0;
-
-    // 헤더/공백/합계행은 제외
     if (!job || !hasMoney) continue;
     if (norm(job).includes("직명") || nt.includes("일련번호") || nt.includes("소계")) continue;
-
+    dataStarted = true;
     rows.push({ rowNumber: r + 1, section, job, name, base, allowances: allowanceValues, total: toNumber(row[totalCol]) });
   }
-  return buildSalarySummary(rows, allowanceCols);
+
+  if (!rows.length) {
+    const preview = m.slice(Math.max(0, headerIndex - 2), headerIndex + 10).map((row, i) => `${Math.max(0, headerIndex - 2) + i + 1}: ${row.map(v => String(v || "").replace(/\n/g, "/")).join(" | ")}`).join("\n");
+    throw new Error(`보수 시트(${sheet.name})에서 데이터 행을 찾지 못했습니다. 인식 열: 직명 ${jobCol + 1}, 본봉 ${baseCol + 1}, 지급액계 ${totalCol + 1}\n미리보기:\n${preview}`);
+  }
+
+  const summary = buildSalarySummary(rows, allowanceCols);
+  summary.detectedColumns = { jobCol: jobCol + 1, baseCol: baseCol + 1, totalCol: totalCol + 1, headerRow: headerIndex + 1 };
+  return summary;
 }
 
 function prettyHeader(h) {
-  return String(h || "").replace(/[A-Z]\)?/g, "").replace(/[()=~]/g, " ").replace(/\s+/g, "").trim();
+  return String(h || "")
+    .replace(/[\n\r]/g, "")
+    .replace(/\([A-Z]\)/g, "")
+    .replace(/[A-Z]\)?/g, "")
+    .replace(/[()=~]/g, " ")
+    .replace(/\s+/g, "")
+    .trim();
 }
 
 function buildSalarySummary(rows, allowanceCols) {
@@ -220,7 +280,12 @@ function parseRetirement(sheets) {
     let local = 0;
     for (const row of s.matrix) {
       for (const v of row) {
-        const n = toNumber(v);
+        // 퇴직 관련 시트라도 수식 결과 또는 입력값이 0이면
+        // 퇴직 적립금액이 없는 것으로 봅니다.
+        // XLSX가 수식 셀을 객체로 넘기는 경우에는 계산 결과(v.v)를 우선 사용합니다.
+        let raw = v;
+        if (raw && typeof raw === "object" && "v" in raw) raw = raw.v;
+        const n = toNumber(raw);
         if (n > 0) local += n;
       }
     }
@@ -346,6 +411,7 @@ function analyze(excel, pdf) {
 
   debug.push(`선택된 보수 시트: ${excel.salarySheet?.name || "없음"}`);
   debug.push(`보수 인식: 교원 ${s.teachers.length}명(정규 ${s.regularTeachers.length}, 방과후 ${s.afterSchoolTeachers.length}), 직원 ${s.staff.length}명`);
+  debug.push(`인식 열: 직명 ${s.detectedColumns?.jobCol || "?"}, 본봉 ${s.detectedColumns?.baseCol || "?"}, 지급액계 ${s.detectedColumns?.totalCol || "?"}, 헤더행 ${s.detectedColumns?.headerRow || "?"}`);
   debug.push(`수당 열: ${s.allowanceHeaders.join(", ")}`);
   debug.push(`퇴직 관련 시트: ${excel.retirement.sheets.join(", ") || "없음"}`);
 
