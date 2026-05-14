@@ -251,8 +251,8 @@ function parseSalarySheet(sheetName, aoa){
   const headerRow = findHeaderRow(aoa, [jobCol, baseCol, totalCol]);
   const allowanceCols = [];
   for(let c=baseCol+1; c<totalCol; c++){
-    const h = colText[c];
-    if(h && !/성명|호봉|직명|일련/.test(h)) allowanceCols.push({ col:c, name:cleanHeader(h) || `열${c+1}` });
+    const h = headerNameForCol(aoa, c, headerRow) || cleanHeader(colText[c]);
+    if(h && !/성명|호봉|직명|일련|본봉|기본급|지급액계|합계|소계/.test(h)) allowanceCols.push({ col:c, name:h || `열${c+1}` });
   }
   const teacherEnd = findRow(aoa, headerRow+1, /소계\s*\(?교원\)?|소계교원/);
   const staffEnd = findRow(aoa, (teacherEnd>=0?teacherEnd+1:headerRow+1), /소계\s*\(?(직원|일반직)\)?|소계직원|소계일반직/);
@@ -295,6 +295,18 @@ function summarizeSalary(teacherRows, staffRows, teacherSubtotal, staffSubtotal,
   return {교원:{...t, 소계본봉:teacherSubtotal?.본봉||0, 소계지급액계:teacherSubtotal?.지급액계||0}, 직원:{...s, 소계본봉:staffSubtotal?.본봉||0, 소계지급액계:staffSubtotal?.지급액계||0}, 수당:allowances};
 }
 function cleanHeader(s){ return text(s).replace(/\([A-Z]\)/g,'').replace(/\s+/g,' ').trim().slice(0,40); }
+function headerNameForCol(aoa, col, headerRow){
+  const start = Math.max(0, headerRow - 6);
+  const end = Math.min(aoa.length - 1, headerRow + 2);
+  const vals = [];
+  for(let r=start; r<=end; r++){
+    const v = text(aoa[r]?.[col]);
+    if(!v) continue;
+    if(toNum(v) || /소계|합계|원장|교사|직원|성명|직명|호봉|순번|번호|구분/.test(v)) continue;
+    vals.push(v);
+  }
+  return cleanHeader([...new Set(vals)].join(' '));
+}
 function parseRetireSheet(sheetName, aoa){
   let positive = 0, cells=[];
   aoa.forEach((r,ri)=>r.forEach((v,ci)=>{ const n=toNum(v); const around=r.map(text).join(' '); if(n>0 && !/연도|년월|날짜/.test(around)){ positive += n; cells.push({행:ri+1, 열:ci+1, 값:n, 주변:around.slice(0,160)}); } }));
@@ -320,49 +332,137 @@ function groupPdfLines(items){
   return [...buckets.entries()].sort((a,b)=>b[0]-a[0]).map(([y,arr])=>({y, text:arr.sort((a,b)=>a.x-b.x).map(x=>x.str).join(' ').replace(/\s+/g,' ').trim()})).filter(l=>l.text);
 }
 function extractBudgetItems(lines){
-  const out=[]; let context={관:'',항:'',목:''};
+  const out=[];
+  let currentTotal = null;
   for(let i=0;i<lines.length;i++){
     const l=lines[i], t=l.text;
-    const nums = [...t.matchAll(/(?:^|\s)([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,7})(?=\s|$)/g)].map(m=>toNum(m[1]));
-    const label = t.replace(/[0-9,]+/g,' ').replace(/\s+/g,' ').trim();
-    if(nums.length>=4 && !/산출|예산구분|발행일/.test(t)){
-      const total = nums[nums.length-1]*1000;
-      const itemName = label.split(' ').filter(x=>!/(보조금|지원금|수익자|부담금|그밖의|수입|합계)/.test(x)).join(' ').trim() || label;
-      context.목 = itemName;
-      out.push({페이지:l.page, 행:i+1, 항목:itemName, PDF금액:total, PDF금액천원:nums[nums.length-1], 인원:null, 산출기초:'', 구분:'총액행'});
+    const totalRow = parseTotalBudgetRow(t);
+    if(totalRow){
+      currentTotal = {항목:totalRow.항목, 페이지:l.page, 행:i+1, 금액:totalRow.금액};
+      out.push({페이지:l.page, 행:i+1, 상위항목:'', 항목:totalRow.항목, PDF금액:totalRow.금액, PDF금액천원:Math.round(totalRow.금액/1000), 인원:null, 산출기초:'', 구분:'총액행'});
+      continue;
     }
-    const calc = t.match(/(.+?)\s+([0-9,]+)원\s*\*\s*([0-9,]+)명\s*\*\s*([0-9,]+)월\s*=\s*([0-9,]+)\s*$/);
+    const calc = parseCalcLine(t);
     if(calc){
-      const prev = [lines[i-2]?.text, lines[i-1]?.text].filter(Boolean).join(' ');
-      const name = prev.replace(/\(본예산\)|\(보조금및지원금\)|\(수익자부담금\)|\(그밖의수입\)/g,' ').replace(/\s+/g,' ').trim() || context.목;
-      out.push({페이지:l.page, 행:i+1, 항목:name, PDF금액:toNum(calc[5]), PDF금액천원:Math.round(toNum(calc[5])/1000), 인원:toNum(calc[3]), 산출기초:t, 구분:'산출기초'});
-    } else {
-      const calc2 = t.match(/(.+?)\s+([0-9,]+)원\s*\*\s*([0-9,]+)월\s*=\s*([0-9,]+)\s*$/);
-      if(calc2){
-        const prev = [lines[i-2]?.text, lines[i-1]?.text].filter(Boolean).join(' ');
-        const name = prev.replace(/\(본예산\)|\(보조금및지원금\)|\(수익자부담금\)|\(그밖의수입\)/g,' ').replace(/\s+/g,' ').trim() || context.목;
-        out.push({페이지:l.page, 행:i+1, 항목:name, PDF금액:toNum(calc2[4]), PDF금액천원:Math.round(toNum(calc2[4])/1000), 인원:null, 산출기초:t, 구분:'산출기초'});
-      }
+      const name = findCalcName(lines, i) || currentTotal?.항목 || '산출항목미상';
+      out.push({페이지:l.page, 행:i+1, 상위항목:currentTotal?.항목 || '', 항목:name, PDF금액:calc.amount, PDF금액천원:Math.round(calc.amount/1000), 인원:calc.people, 산출기초:t, 구분:'산출기초'});
     }
   }
   return out.filter(x=>!LEGAL_RE.test(x.항목));
 }
+function parseTotalBudgetRow(t){
+  if(/산출|예산구분|발행일|과\s*목|보조금|수익자/.test(t)) return null;
+  const m = t.match(/^\s*([^0-9=]{2,40}?)\s+([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)\s+([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)\s+([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)\s+([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)\s*$/);
+  if(!m) return null;
+  const name = text(m[1]).replace(/\s+/g,'').trim();
+  if(!name || /본예산|단위|천원/.test(name)) return null;
+  return {항목:name, 금액:toNum(m[5])*1000};
+}
+function parseCalcLine(t){
+  const compact = t.replace(/\s+/g,'');
+  let m = compact.match(/([0-9,]+)원\*([0-9,]+)명\*([0-9,]+)월=([0-9,]+)$/);
+  if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:toNum(m[3]), amount:toNum(m[4])};
+  m = compact.match(/([0-9,]+)원\*([0-9,]+)월=([0-9,]+)$/);
+  if(m) return {unit:toNum(m[1]), people:null, months:toNum(m[2]), amount:toNum(m[3])};
+  m = compact.match(/([0-9,]+)원\*([0-9,]+)명\*1월=([0-9,]+)$/);
+  if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:1, amount:toNum(m[3])};
+  return null;
+}
+function findCalcName(lines, idx){
+  for(let j=idx-1; j>=Math.max(0, idx-6); j--){
+    let s = text(lines[j]?.text || '');
+    s = s.replace(/\(본예산\)|\(보조금및지원금\)|\(수익자부담금\)|\(그밖의수입\)/g,' ')
+         .replace(/교\s*$/,'').replace(/환\s*$/,'').replace(/운\s*$/,'').replace(/경\s*$/,'')
+         .replace(/\s+/g,' ').trim();
+    if(!s) continue;
+    if(/[0-9,]+원\s*\*/.test(s)) continue;
+    if(/예산구분|발행일|산출|과\s*목/.test(s)) continue;
+    const cleaned = s.replace(/\s+/g,'');
+    if(cleaned.length >= 2 && cleaned.length <= 40) return cleaned;
+  }
+  return '';
+}
 
 function buildPrecheck(report){
   const rows=[];
+  const issues=[];
   const ex = report.excel?.salary?.summary;
   const pdfItems = report.pdf?.items || [];
-  const findPdf = (re) => pdfItems.filter(x=>re.test(x.항목));
+  const totals = pdfItems.filter(x=>x.구분==='총액행');
+  const calcs = pdfItems.filter(x=>x.구분==='산출기초');
+  const totalByName = (name) => totals.find(x=>norm(x.항목)===norm(name))?.PDF금액 || 0;
+  const calcByName = (re) => calcs.filter(x=>re.test(x.항목));
+  const amountByCalc = (re) => calcByName(re).reduce((s,x)=>s+x.PDF금액,0);
+  const peopleByCalc = (re) => calcByName(re).reduce((s,x)=>s+(x.인원||0),0);
+  const verdict = (excelAmount, pdfAmount, excelPeople, pdfPeople) => {
+    const amountOk = Number(excelAmount||0) === Number(pdfAmount||0);
+    const peopleOk = pdfPeople === '' || pdfPeople === null || pdfPeople === undefined ? true : Number(excelPeople||0) === Number(pdfPeople||0);
+    if(amountOk && peopleOk) return '일치';
+    const parts=[]; if(!amountOk) parts.push('금액 차이'); if(!peopleOk) parts.push('인원 차이'); return parts.join(', ');
+  };
   if(ex){
-    const teacherPay = findPdf(/교원급여/).reduce((s,x)=>s+x.PDF금액,0);
-    const teacherPeople = Math.max(...findPdf(/교원급여/).map(x=>x.인원||0),0)||'';
-    rows.push({항목:'교원급여', 엑셀금액:ex.교원.소계본봉||ex.교원.본봉, 엑셀인원:ex.교원.인원, PDF금액:teacherPay, PDF인원:teacherPeople, 확인:'값 확인 필요'});
-    const staffPay = findPdf(/직원급여|사무직원급여|조리직원급여|보조교사급여|차량기사급여|차량보조급여|환경미화원급여/).reduce((s,x)=>s+x.PDF금액,0);
-    rows.push({항목:'직원급여', 엑셀금액:ex.직원.소계본봉||ex.직원.본봉, 엑셀인원:ex.직원.인원, PDF금액:staffPay, PDF인원:'', 확인:'값 확인 필요'});
-    ex.수당.forEach(a=>{ if(!LEGAL_RE.test(a.항목)) rows.push({항목:a.항목, 엑셀금액:a.교원금액+a.직원금액, 엑셀인원:'', PDF금액:'', PDF인원:'', 확인:'수당 추출됨'}); });
+    const teacherBase = ex.교원.소계본봉 || ex.교원.본봉;
+    const staffBase = ex.직원.소계본봉 || ex.직원.본봉;
+    const teacherPayTotal = totalByName('교원급여') || amountByCalc(/^교원급여$/);
+    const teacherPayPeople = peopleByCalc(/^교원급여$/) || '';
+    rows.push({구분:'급여', 항목:'교원급여', 엑셀금액:teacherBase, 엑셀인원:ex.교원.인원, PDF금액:teacherPayTotal, PDF인원:teacherPayPeople, 확인:verdict(teacherBase, teacherPayTotal, ex.교원.인원, teacherPayPeople)});
+
+    const afterTeacherPay = amountByCalc(/방과후.*교원.*급여|방과후교원급여/);
+    const afterTeacherPeople = peopleByCalc(/방과후.*교원.*급여|방과후교원급여/) || '';
+    if(afterTeacherPay) rows.push({구분:'급여', 항목:'방과후교원급여', 엑셀금액:'', 엑셀인원:'', PDF금액:afterTeacherPay, PDF인원:afterTeacherPeople, 확인:'PDF 산출기초 확인'});
+
+    const staffPayTotal = totalByName('직원급여') || amountByCalc(/사무직원급여|조리직원급여|보조교사급여|차량기사급여|차량보조급여|환경미화원급여/);
+    const staffPayPeople = peopleByCalc(/사무직원급여|조리직원급여|보조교사급여|차량기사급여|차량보조급여|환경미화원급여/) || '';
+    rows.push({구분:'급여', 항목:'직원급여', 엑셀금액:staffBase, 엑셀인원:ex.직원.인원, PDF금액:staffPayTotal, PDF인원:staffPayPeople, 확인:verdict(staffBase, staffPayTotal, ex.직원.인원, '')});
+
+    const teacherAllowanceTotal = totalByName('교원수당');
+    const staffAllowanceTotal = totalByName('직원수당');
+    const allowanceRows = ex.수당.filter(a=>!LEGAL_RE.test(a.항목));
+    const teacherAllowanceExcel = allowanceRows.reduce((s,a)=>s+a.교원금액,0);
+    const staffAllowanceExcel = allowanceRows.reduce((s,a)=>s+a.직원금액,0);
+    rows.push({구분:'수당', 항목:'교원수당', 엑셀금액:teacherAllowanceExcel, 엑셀인원:'', PDF금액:teacherAllowanceTotal, PDF인원:'', 확인:allowanceVerdict('교원', allowanceRows, pdfItems, teacherAllowanceTotal)});
+    rows.push({구분:'수당', 항목:'직원수당', 엑셀금액:staffAllowanceExcel, 엑셀인원:'', PDF금액:staffAllowanceTotal, PDF인원:'', 확인:allowanceVerdict('직원', allowanceRows, pdfItems, staffAllowanceTotal)});
+
+    const car = allowanceRows.find(a=>/자가운전|자가.*운전|차량보조|차량.*보조/.test(a.항목));
+    if(car && (car.교원금액 || car.직원금액)){
+      const pdfHasCar = pdfItems.some(x=>/자가운전|자가.*운전/.test(x.항목));
+      if(!pdfHasCar) issues.push({번호:issues.length+1, 지적내용:'교원 및 직원 자가운전보조금 예산 미편성', 근거:`엑셀 자가운전보조금: 교원 ${fmt(car.교원금액)}, 직원 ${fmt(car.직원금액)} / PDF 개별 항목 없음`});
+    }
   }
-  return rows;
+
+  const vehicleWrong = calcs.find(x=>/차량기사급여/.test(x.항목) && /통학차량이용비|차량이용비|차량/.test(x.상위항목));
+  if(vehicleWrong){
+    issues.push({번호:issues.length+1, 지적내용:`차량기사급여 ${Math.round(vehicleWrong.PDF금액/10000).toLocaleString('ko-KR')}만원을 직원인건비가 아닌 ${vehicleWrong.상위항목}의 산출내역에 편성`, 근거:`PDF ${vehicleWrong.페이지}쪽: ${vehicleWrong.산출기초}`});
+  }
+
+  const excelRetire = (report.excel?.retirement || []).some(r=>r.hasRetirementAmount);
+  const pdfRetire = pdfItems.some(x=>/퇴직.*적립|퇴직금|퇴직급여|퇴직충당/.test(x.항목));
+  if(excelRetire && !pdfRetire){
+    issues.push({번호:issues.length+1, 지적내용:'엑셀에는 퇴직 적립금액이 있으나 퇴직적립금 미편성', 근거:'퇴직 관련 엑셀 시트에는 0원을 초과하는 금액이 있으나 PDF에서 퇴직 관련 편성 항목을 찾지 못했습니다.'});
+  }
+  return {rows, issues};
 }
+function allowanceVerdict(kind, allowanceRows, pdfItems, groupTotal){
+  const amountField = kind === '교원' ? '교원금액' : '직원금액';
+  const relevant = allowanceRows.filter(a=>a[amountField]);
+  const direct = [];
+  const missing = [];
+  for(const a of relevant){
+    const key = allowanceKey(a.항목);
+    const hit = key && pdfItems.some(x=>allowanceKey(x.항목).includes(key) || key.includes(allowanceKey(x.항목)));
+    (hit ? direct : missing).push(a);
+  }
+  const missingSum = missing.reduce((s,a)=>s+a[amountField],0);
+  if(!groupTotal && missingSum) return `추가확인필요: PDF ${kind}수당 총액행 없음`;
+  if(missingSum && missingSum === groupTotal) return `통합편성(${missing.map(a=>`${a.항목} ${fmt(a[amountField])}`).join(' + ')} = ${fmt(missingSum)})`;
+  if(relevant.reduce((s,a)=>s+a[amountField],0) === groupTotal) return '총액 일치';
+  if(missingSum) return `추가확인필요: 미개별표시 수당 합계 ${fmt(missingSum)}, PDF ${kind}수당 ${fmt(groupTotal)}`;
+  return '개별 또는 총액 확인';
+}
+function allowanceKey(s){
+  return norm(s).replace(/수당|보조금|지원비|비/g,'');
+}
+
 function render(report){
   if(report.excel){
     const ex=report.excel;
@@ -393,5 +493,8 @@ function render(report){
     html += '<h3 class="section-title">PDF 원문 라인</h3>'+table(['페이지','y','텍스트'], pdf.lines.slice(0,300), {small:true});
     $('pdfTables').innerHTML = html;
   }
-  $('precheck').innerHTML = table(['항목','엑셀금액','엑셀인원','PDF금액','PDF인원','확인'], report.precheck.map(r=>({...r,엑셀금액:fmt(r.엑셀금액),PDF금액:fmt(r.PDF금액)})));
+  const review = report.precheck || {rows:[], issues:[]};
+  let reviewHtml = '<h3 class="section-title">금액 및 인원 검토</h3>' + table(['구분','항목','엑셀금액','엑셀인원','PDF금액','PDF인원','확인'], review.rows.map(r=>({...r,엑셀금액:fmt(r.엑셀금액),PDF금액:fmt(r.PDF금액)})));
+  reviewHtml += '<h3 class="section-title">지적사항</h3>' + table(['번호','지적내용','근거'], review.issues || []);
+  $('precheck').innerHTML = reviewHtml;
 }
