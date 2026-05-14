@@ -86,16 +86,32 @@ function scoreSalarySheet(sheet) {
 
 function parseSalarySheet(sheet) {
   const m = sheet.matrix;
-  const headerIndex = m.findIndex(row => row.some(c => norm(c).includes("직명")) && row.some(c => norm(c).includes("본봉") || norm(c).includes("기본급")));
-  if (headerIndex < 0) throw new Error(`보수 시트 후보(${sheet.name})에서 직명/본봉 헤더를 찾지 못했습니다.`);
+  const maxCols = Math.max(...m.map(r => r.length), 0);
 
-  const rowA = m[headerIndex] || [];
-  const rowB = m[headerIndex + 1] || [];
-  const headers = rowA.map((v, i) => norm(String(v || "") + " " + String(rowB[i] || "")));
+  // 한셀/엑셀 양식은 헤더가 2행 이상으로 나뉘거나 병합셀 때문에 같은 행에 안 잡힐 수 있습니다.
+  // 따라서 현재 행 + 다음 2행을 합쳐서 직명/본봉/지급액계를 찾습니다.
+  let headerIndex = -1;
+  for (let r = 0; r < m.length; r++) {
+    const blockText = norm([m[r] || [], m[r + 1] || [], m[r + 2] || []].flat().join(" "));
+    if (blockText.includes("직명") && (blockText.includes("본봉") || blockText.includes("기본급")) && blockText.includes("지급액계")) {
+      headerIndex = r;
+      break;
+    }
+  }
+  if (headerIndex < 0) {
+    const preview = m.slice(0, 12).map((row, i) => `${i + 1}: ${row.map(v => String(v || "").replace(/\n/g, "/")).join(" | ")}`).join("\n");
+    throw new Error(`보수 시트 후보(${sheet.name})에서 직명/본봉/지급액계 헤더를 찾지 못했습니다.\n상단 미리보기:\n${preview}`);
+  }
+
+  const headers = Array.from({ length: maxCols }, (_, i) =>
+    norm(String((m[headerIndex] || [])[i] || "") + " " + String((m[headerIndex + 1] || [])[i] || "") + " " + String((m[headerIndex + 2] || [])[i] || ""))
+  );
   const jobCol = headers.findIndex(h => h.includes("직명"));
   const baseCol = headers.findIndex(h => h.includes("본봉") || h.includes("기본급"));
   const totalCol = headers.findIndex(h => h.includes("지급액계"));
-  if (jobCol < 0 || baseCol < 0 || totalCol < 0) throw new Error(`보수 시트(${sheet.name})에서 직명/본봉/지급액계 열을 찾지 못했습니다.`);
+  if (jobCol < 0 || baseCol < 0 || totalCol < 0) {
+    throw new Error(`보수 시트(${sheet.name})에서 열 위치를 찾지 못했습니다. 인식된 헤더: ${headers.filter(Boolean).join(", ")}`);
+  }
 
   const allowanceCols = [];
   for (let c = baseCol + 1; c < totalCol; c++) {
@@ -233,24 +249,45 @@ function parsePdfBudget(lines) {
 
 function inferDetailName(lines, i) {
   const currentPage = lines[i].page;
-  let nextName = "";
+
+  const candidates = [];
+  // 같은 줄에서 산출식 앞쪽에 항목명이 붙어 있는 경우
+  const beforeFormula = lines[i].line.split(/\d[\d,]*원\s*\*/)[0] || "";
+  if (beforeFormula) candidates.push(beforeFormula);
+
+  // 보통 PDF 텍스트는 “(본예산) ... 항목명” 다음 줄에 산출식이 옵니다.
+  for (let j = i - 1; j >= Math.max(0, i - 8); j--) {
+    if (lines[j].page !== currentPage) break;
+    candidates.push(lines[j].line);
+  }
   for (let j = i + 1; j < Math.min(lines.length, i + 4); j++) {
     if (lines[j].page !== currentPage) break;
-    const s = lines[j].line.trim();
-    if (!s || s.includes("본예산") || /원\s*\*/.test(s) || s.includes("발행일")) continue;
-    nextName = cleanPdfName(s);
-    break;
+    candidates.push(lines[j].line);
   }
-  let prefix = "";
-  for (let j = i - 1; j >= Math.max(0, i - 3); j--) {
-    if (lines[j].page !== currentPage) break;
-    const s = lines[j].line.trim();
-    const m = s.match(/\)\s*([가-힣A-Za-z]+)$/);
-    if (m && m[1].length <= 3) { prefix = cleanPdfName(m[1]); break; }
+
+  for (const cand of candidates) {
+    let s = String(cand || "").trim();
+    if (!s || /원\s*\*/.test(s) || s.includes("발행일") || s.includes("예산구분")) continue;
+    // 총액 행은 산출항목명이 아니므로 제외
+    if (/^[가-힣A-Za-z0-9(),·]+\s+[0-9,]+\s+[0-9,]+\s+[0-9,]+\s+[0-9,]+/.test(s)) continue;
+    let name = cleanPdfName(s);
+    name = repairPdfItemName(name);
+    if (name && name.length >= 3 && !["본예산", "보조금및지원금", "수익자부담금"].includes(name)) return name;
   }
-  let name = cleanPdfName(prefix + nextName);
-  name = name.replace(/^원급여$/, "교원급여").replace(/^원수당$/, "교원수당").replace(/^경미화원급여$/, "환경미화원급여").replace(/^량기사급여$/, "차량기사급여").replace(/^량적립금$/, "차량적립금");
-  return name || "산출항목명확인불가";
+  return "산출항목명확인불가";
+}
+
+function repairPdfItemName(name) {
+  return cleanPdfName(name)
+    .replace(/^원급여$/, "교원급여")
+    .replace(/^교원급여교원급여$/, "교원급여")
+    .replace(/^원수당$/, "교원수당")
+    .replace(/^경미화원급여$/, "환경미화원급여")
+    .replace(/^량기사급여$/, "차량기사급여")
+    .replace(/^량적립금$/, "차량적립금")
+    .replace(/^리대체인력비$/, "조리대체인력비")
+    .replace(/^품구입비$/, "비품구입비")
+    .replace(/^수공사비$/, "보수공사비");
 }
 
 function cleanPdfName(s) {
@@ -270,7 +307,7 @@ function analyze(excel, pdf) {
   debug.push(`수당 열: ${s.allowanceHeaders.join(", ")}`);
   debug.push(`퇴직 관련 시트: ${excel.retirement.sheets.join(", ") || "없음"}`);
 
-  compareGroup(results, "보수", "교원급여", s.regularTeacherPay, getPdfRegularTeacherPay(pdf), true);
+  compareGroup(results, "보수", "교원급여", { amount: s.teacherPayTotal.amount, people: s.regularTeacherPay.people }, getPdfTeacherPayGroup(pdf), true);
   compareGroup(results, "보수", "방과후교원급여", s.afterSchoolPay, getPdfDetailSum(pdf, ["방과후교원급여"]), true);
   compareGroup(results, "보수", "직원급여", s.staffPay, getPdfTotal(pdf, "직원급여"), false);
   compareAllowance(results, notes, "교원수당", s.teacherAllowances, pdf);
@@ -294,9 +331,10 @@ function getPdfDetailSum(pdf, names) {
   return { amount: arr.reduce((a, d) => a + d.amount, 0), people: uniquePeople(arr), basis: arr.map(d => `${d.item} ${fmt(d.amount)}원`).join(" + "), page: arr[0]?.page || 0 };
 }
 
-function getPdfRegularTeacherPay(pdf) {
+function getPdfTeacherPayGroup(pdf) {
+  const total = getPdfTotal(pdf, "교원급여");
   const arr = pdf.details.filter(d => norm(d.item).includes("교원급여") && !norm(d.item).includes("방과후"));
-  return { amount: arr.reduce((a, d) => a + d.amount, 0), people: uniquePeople(arr), basis: arr.map(d => `${d.item} ${fmt(d.amount)}원/${d.people || "?"}명`).join(" + "), page: arr[0]?.page || 0 };
+  return { amount: total.amount || arr.reduce((a, d) => a + d.amount, 0), people: uniquePeople(arr), basis: arr.map(d => `${d.item} ${fmt(d.amount)}원/${d.people || "?"}명`).join(" + "), page: total.page || arr[0]?.page || 0 };
 }
 
 function uniquePeople(arr) {
@@ -356,17 +394,13 @@ function checkSelfDrivingAllowance(issues, salary, pdf) {
 }
 
 function checkMisclassifiedPersonnel(issues, pdf) {
-  const targets = ["차량기사급여", "영양사급여", "영양사인건비", "조리직원급여", "보조교사급여", "환경미화원급여"];
+  // 1차 버전에서는 오탐을 막기 위해 구체적으로 확인된 사례만 지적합니다.
+  // 향후 영양사/조리원 등은 “항목명+금액+비인건비 위치”가 안정적으로 잡힐 때 확장합니다.
   pdf.details.forEach(d => {
     const item = norm(d.item);
-    if (!targets.some(t => item.includes(norm(t)))) return;
     const section = norm(d.section);
-    const isAllowed = CONFIG.allowedPersonnelSections.some(s => section.includes(norm(s)));
-    if (isAllowed) return;
     if (item.includes("차량기사급여") && section.includes("통학차량이용비")) {
       issues.push({ category: "지적사항", item: "차량기사급여 오편성", excelAmount: "-", pdfAmount: d.amount, excelPeople: "-", pdfPeople: d.people || "-", status: "bad", message: `차량기사급여 ${fmt(d.amount)}원을 직원인건비가 아닌 통학차량이용비의 산출내역에 편성 (PDF ${d.page}쪽)` });
-    } else {
-      issues.push({ category: "지적사항", item: `${d.item} 오편성`, excelAmount: "-", pdfAmount: d.amount, excelPeople: "-", pdfPeople: d.people || "-", status: "bad", message: `${d.item} ${fmt(d.amount)}원을 ${d.section || "비인건비 과목"}에 편성 (PDF ${d.page}쪽)` });
     }
   });
 }
