@@ -1,0 +1,13 @@
+{
+  "name": "budget-review-static-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "python3 -m http.server 8788 -d public",
+    "check": "node --check public/app.js",
+    "smoke": "node scripts/smoke_test.mjs",
+    "audit:security": "node scripts/security_audit.mjs",
+    "audit:free-tier": "node scripts/free_tier_audit.mjs"
+  }
+}
