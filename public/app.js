@@ -243,15 +243,12 @@ async function readSharedStrings(zip, parser){
   const f = zip.file('xl/sharedStrings.xml');
   if(!f) return [];
   const raw = await f.async('string');
-  try{
-    const xml = parser.parseFromString(raw, 'application/xml');
-    const parsed = localElements(xml, 'si').map(si => localElements(si, 't').map(t=>t.textContent || '').join(''));
-    if(parsed.length) return parsed;
-  }catch(e){
-    console.warn('sharedStrings DOM parse failed, using regex fallback', e);
-  }
-  // 한컴/HCell 또는 일부 Excel 파일에서 XML namespace/호환성 태그 때문에 DOMParser가 값을 못 잡는 경우를 대비한 보조 파서
-  const result = [];
+
+  // v36: 한컴/HCell 파일은 sharedStrings가 x: 접두어로 저장되는 경우가 많습니다.
+  // DOMParser 결과가 비어 있거나 일부만 읽히면 헤더가 전부 숫자 인덱스로 남아
+  // '직명/본봉/지급액계 헤더 미발견'이 됩니다.
+  // 그래서 정규식 파서를 항상 먼저 만들어 두고, DOM 결과보다 풍부하면 정규식 결과를 사용합니다.
+  const regexResult = [];
   const siRe = /<(?:\w+:)?si\b[^>]*>([\s\S]*?)<\/(?:\w+:)?si>/g;
   let m;
   while((m = siRe.exec(raw))){
@@ -260,9 +257,20 @@ async function readSharedStrings(zip, parser){
     const tRe = /<(?:\w+:)?t\b[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/g;
     let tm;
     while((tm = tRe.exec(block))) parts.push(xmlDecode(tm[1]));
-    result.push(parts.join(''));
+    regexResult.push(parts.join(''));
   }
-  return result;
+
+  let domResult = [];
+  try{
+    const xml = parser.parseFromString(raw, 'application/xml');
+    domResult = localElements(xml, 'si').map(si => localElements(si, 't').map(t=>t.textContent || '').join(''));
+  }catch(e){
+    console.warn('sharedStrings DOM parse failed, using regex fallback', e);
+  }
+
+  const domUseful = domResult.filter(Boolean).length;
+  const regexUseful = regexResult.filter(Boolean).length;
+  return regexUseful >= domUseful ? regexResult : domResult;
 }
 
 function localElements(root, localName){
@@ -292,11 +300,28 @@ async function sheetXmlToAoa(zip, path, sharedStrings, parser){
     console.warn('sheet XML DOM parse failed, using regex fallback', e);
   }
   // DOMParser가 빈 값처럼 읽었거나 shared string이 해석되지 않은 경우, 원문 XML 기반 파서로 재시도합니다.
-  if(!aoaHasSalaryHeaderLikeText(aoa)){
-    const regexAoa = sheetXmlToAoaByRegex(raw, sharedStrings);
-    if(aoaScoreForHeaders(regexAoa) >= aoaScoreForHeaders(aoa)) aoa = regexAoa;
+  // v36: 헤더 점수뿐 아니라 실제 텍스트 개수도 비교합니다. 일부 파일은 DOM AOA가 숫자 인덱스만
+  // 채워져 점수는 0이지만 행 수는 존재하므로, 정규식 AOA가 더 많은 텍스트를 복원하면 그것을 채택합니다.
+  const regexAoa = sheetXmlToAoaByRegex(raw, sharedStrings);
+  const domScore = aoaScoreForHeaders(aoa);
+  const regexScore = aoaScoreForHeaders(regexAoa);
+  const domText = countUsefulTextCells(aoa);
+  const regexText = countUsefulTextCells(regexAoa);
+  if(regexScore > domScore || (regexScore === domScore && regexText > domText)){
+    aoa = regexAoa;
   }
   return aoa;
+}
+
+function countUsefulTextCells(aoa){
+  let n = 0;
+  for(const r of (aoa || []).slice(0,120)){
+    for(const v of (r || [])){
+      const t = text(v);
+      if(t && /[가-힣A-Za-z]/.test(t)) n++;
+    }
+  }
+  return n;
 }
 
 function aoaHasSalaryHeaderLikeText(aoa){
@@ -595,9 +620,75 @@ function headerNameForCol(aoa, col, headerRow){
   return cleanHeader([...new Set(vals)].join(' '));
 }
 function parseRetireSheet(sheetName, aoa){
-  let positive = 0, cells=[];
-  aoa.forEach((r,ri)=>r.forEach((v,ci)=>{ const n=toNum(v); const around=r.map(text).join(' '); if(n>0 && !/연도|년월|날짜/.test(around)){ positive += n; cells.push({행:ri+1, 열:ci+1, 값:n, 주변:around.slice(0,160)}); } }));
-  return {sheetName, positiveAmount:positive, hasRetirementAmount:positive>0, positiveCells:cells.slice(0,30)};
+  // v37: 퇴직 시트의 모든 숫자를 더하지 않고, 실제 `퇴직적립금` 열만 읽습니다.
+  // 적립인원/예금이자/소계/지급액/이월액/날짜/연도 숫자는 제외합니다.
+  const maxHeaderRows = Math.min(12, aoa.length);
+  const maxCols = Math.max(0, ...aoa.slice(0, Math.min(30, aoa.length)).map(r=>r.length || 0));
+  const retireCols = [];
+  for(let c=0; c<maxCols; c++){
+    const headerVals = [];
+    for(let r=0; r<maxHeaderRows; r++){
+      const v = text(aoa[r]?.[c]);
+      if(v) headerVals.push(v);
+    }
+    const h = headerVals.join(' ');
+    const hn = norm(h);
+    const isRetireAmountCol = /퇴직.*적립금|퇴직금.*적립금|퇴직적립금/.test(hn);
+    const excluded = /인원|예금|이자|소계|합계|계\s*\(|지급액|지급인원|이월|날짜|년월|월수|일수|요율|율/.test(h);
+    if(isRetireAmountCol && !excluded){
+      retireCols.push({col:c, header:h.slice(0,80)});
+    }
+  }
+
+  // 헤더가 병합되어 열 제목을 못 잡는 일부 서식 보정: 셀 자체가 `퇴직 적립금`인 열을 다시 확인
+  if(!retireCols.length){
+    for(let r=0; r<maxHeaderRows; r++){
+      for(let c=0; c<(aoa[r]?.length||0); c++){
+        const h = text(aoa[r][c]);
+        const hn = norm(h);
+        if(/퇴직.*적립금|퇴직적립금/.test(hn) && !/인원|이자|소계|합계|지급|이월/.test(h)){
+          retireCols.push({col:c, header:h.slice(0,80)});
+        }
+      }
+    }
+  }
+
+  const headerLastRow = (()=>{
+    let last = 0;
+    for(let r=0; r<maxHeaderRows; r++){
+      const joined = aoa[r]?.map(text).join(' ') || '';
+      if(/퇴\s*직|적\s*립|구분|직종/.test(joined)) last = r;
+    }
+    return last;
+  })();
+
+  const dataCells = [];
+  const totalCells = [];
+  for(let r=headerLastRow+1; r<aoa.length; r++){
+    const row = aoa[r] || [];
+    const rowText = row.map(text).join(' ');
+    if(/연도|년월|날짜/.test(rowText)) continue;
+    const isTotal = /(^|\s)(계|합계|총계)(\s|$)/.test(text(row[0] || rowText));
+    for(const rc of retireCols){
+      const n = toNum(row[rc.col]);
+      if(n > 0){
+        const cell = {행:r+1, 열:rc.col+1, 값:n, 헤더:rc.header, 주변:rowText.slice(0,160)};
+        if(isTotal) totalCells.push(cell); else dataCells.push(cell);
+      }
+    }
+  }
+
+  // 합계행이 있으면 합계행을 우선 사용해 상세행+합계행 이중 집계를 방지합니다.
+  const usedCells = totalCells.length ? totalCells : dataCells;
+  const positive = usedCells.reduce((s,c)=>s+c.값,0);
+  return {
+    sheetName,
+    positiveAmount:positive,
+    hasRetirementAmount:positive>0,
+    retireColumns:retireCols.map(c=>({열:c.col+1, 헤더:c.header})),
+    positiveCells:usedCells.slice(0,30),
+    ignoredPositiveCells:dataCells.length && totalCells.length ? dataCells.slice(0,10) : []
+  };
 }
 
 async function parsePdf(file){
@@ -871,6 +962,47 @@ function addPayBreakdownRows(rows, kind, salaryObj, payCalcs, allCalcs){
   }
 }
 
+function isRetirementName(s){
+  const n = norm(s || '');
+  return /퇴직/.test(n) && /(적립|퇴직금|충당|급여)/.test(n);
+}
+function getExcelRetirementSummary(retirementSheets){
+  const sheets = retirementSheets || [];
+  const amount = sheets.reduce((sum,r)=>sum+Number(r.positiveAmount||0),0);
+  return {
+    amount,
+    has: amount > 0,
+    sheets: sheets.filter(r=>Number(r.positiveAmount||0)>0).map(r=>r.sheetName),
+    cells: sheets.flatMap(r=>(r.positiveCells||[]).map(c=>({...c, sheetName:r.sheetName}))).slice(0,30)
+  };
+}
+function getPdfRetirementSummary(pdfItems){
+  const items = pdfItems || [];
+  const totalRows = items.filter(x=>x.구분==='총액행' && Number(x.PDF금액||0)>0 && isRetirementName(x.항목 || x.목));
+  if(totalRows.length){
+    // 같은 목이 여러 번 잡히는 경우 중복 방지를 위해 목명 기준으로 가장 큰 금액만 사용합니다.
+    const byName = new Map();
+    for(const x of totalRows){
+      const key = norm(x.항목 || x.목);
+      const prev = byName.get(key);
+      if(!prev || Number(x.PDF금액||0) > Number(prev.PDF금액||0)) byName.set(key, x);
+    }
+    const used = [...byName.values()];
+    return {has:true, amount:used.reduce((s,x)=>s+Number(x.PDF금액||0),0), items:used};
+  }
+  const calcRows = items.filter(x=>x.구분==='산출기초' && Number(x.PDF금액||0)>0 && (isRetirementName(x.목) || isRetirementName(x.항목)));
+  return {has:calcRows.length>0, amount:calcRows.reduce((s,x)=>s+Number(x.PDF금액||0),0), items:calcRows};
+}
+function retirementVerdict(excelSummary, pdfSummary){
+  // v38: 퇴직금은 금액 일치 여부를 검토하지 않습니다.
+  // 엑셀에 실제 퇴직 적립금액이 있으면 PDF에 퇴직 관련 목/산출항목이 편성되어 있는지만 확인합니다.
+  const ea = Number(excelSummary.amount || 0), pa = Number(pdfSummary.amount || 0);
+  if(ea > 0 && pa > 0) return `편성 확인(금액 비교 제외 · PDF ${fmt(pa)})`;
+  if(ea > 0 && pa <= 0) return `미편성(엑셀 적립금액 있음 · PDF 퇴직 관련 편성 없음)`;
+  if(ea <= 0 && pa > 0) return `참고: PDF에는 퇴직 관련 편성이 있으나 엑셀 적립금액은 없음(금액 비교 제외)`;
+  return '해당 없음(엑셀 적립금액 없음 · PDF 퇴직 관련 편성 없음)';
+}
+
 function buildPrecheck(report){
   const rows=[];
   const issues=[];
@@ -929,10 +1061,23 @@ function buildPrecheck(report){
 
   // v30: 일반 오편성/미편성 지적사항은 결과표 검토결과 열에만 표시하고, 지적사항 표에는 퇴직적립금만 표시합니다.
 
-  const excelRetire = (report.excel?.retirement || []).some(r=>r.hasRetirementAmount);
-  const pdfRetire = pdfItems.some(x=>/퇴직.*적립|퇴직금|퇴직급여|퇴직충당/.test(x.항목));
-  if(excelRetire && !pdfRetire){
-    addIssue('엑셀에는 퇴직 적립금액이 있으나 퇴직적립금 미편성', '퇴직 관련 엑셀 시트에는 0원을 초과하는 금액이 있으나 PDF에서 퇴직 관련 편성 항목을 찾지 못했습니다.');
+  const excelRetireSummary = getExcelRetirementSummary(report.excel?.retirement || []);
+  const pdfRetireSummary = getPdfRetirementSummary(pdfItems);
+  rows.push({
+    구분:'퇴직',
+    항목:'퇴직적립금',
+    엑셀금액:excelRetireSummary.amount,
+    엑셀인원:'',
+    PDF금액:pdfRetireSummary.amount,
+    PDF인원:'',
+    검토결과:retirementVerdict(excelRetireSummary, pdfRetireSummary)
+  });
+  if(excelRetireSummary.has && !pdfRetireSummary.has){
+    addIssue('엑셀에는 퇴직 적립금액이 있으나 퇴직적립금 미편성', `엑셀 퇴직 관련 시트에서 실제 적립금액이 확인되었으나 PDF에서 퇴직 관련 목/산출항목을 찾지 못했습니다. 퇴직금은 금액 일치 여부는 검토하지 않습니다.`);
+  }
+  if(!excelRetireSummary.has && pdfRetireSummary.has){
+    const names = pdfRetireSummary.items.map(x=>x.항목 || x.목).filter(Boolean).join(', ');
+    addIssue('엑셀 적립금액 없음 / PDF 퇴직 관련 편성 확인', `엑셀 퇴직 관련 시트의 실제 적립금액은 확인되지 않았으나 PDF에서 ${names} 편성이 확인되었습니다. 퇴직금은 금액 비교 대상이 아니므로 필요 시 원자료만 확인하세요.`);
   }
   return {rows, issues};
 }
@@ -1088,7 +1233,13 @@ function render(report){
         html += '<p class="muted">후보 시트에서 직명/본봉/지급액계가 보이지 않으면 엑셀 저장 형식 또는 병합 헤더 문제입니다.</p>';
       }
     }
-    html += '<h3 class="section-title">퇴직 관련 시트</h3>'+table(['sheetName','positiveAmount','hasRetirementAmount'], ex.retirement.map(r=>({sheetName:r.sheetName, positiveAmount:fmt(r.positiveAmount), hasRetirementAmount:r.hasRetirementAmount?'있음':'없음'})));
+    html += '<h3 class="section-title">퇴직 관련 시트</h3>'+table(['sheetName','positiveAmount','hasRetirementAmount','retireColumns','positiveCells'], ex.retirement.map(r=>({
+      sheetName:r.sheetName,
+      positiveAmount:fmt(r.positiveAmount),
+      hasRetirementAmount:r.hasRetirementAmount?'있음':'없음',
+      retireColumns:(r.retireColumns||[]).map(c=>`${c.열}:${c.헤더}`).join(' / '),
+      positiveCells:(r.positiveCells||[]).map(c=>`${c.행}행 ${c.열}열 ${fmt(c.값)}`).join(' / ')
+    })));
     $('excelTables').innerHTML = html;
   }
   if(report.pdf){
