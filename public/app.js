@@ -159,8 +159,27 @@ async function readXlsxRawWorkbook(buf){
 async function readSharedStrings(zip, parser){
   const f = zip.file('xl/sharedStrings.xml');
   if(!f) return [];
-  const xml = parser.parseFromString(await f.async('string'), 'application/xml');
-  return localElements(xml, 'si').map(si => localElements(si, 't').map(t=>t.textContent || '').join(''));
+  const raw = await f.async('string');
+  try{
+    const xml = parser.parseFromString(raw, 'application/xml');
+    const parsed = localElements(xml, 'si').map(si => localElements(si, 't').map(t=>t.textContent || '').join(''));
+    if(parsed.length) return parsed;
+  }catch(e){
+    console.warn('sharedStrings DOM parse failed, using regex fallback', e);
+  }
+  // 한컴/HCell 또는 일부 Excel 파일에서 XML namespace/호환성 태그 때문에 DOMParser가 값을 못 잡는 경우를 대비한 보조 파서
+  const result = [];
+  const siRe = /<(?:\w+:)?si\b[^>]*>([\s\S]*?)<\/(?:\w+:)?si>/g;
+  let m;
+  while((m = siRe.exec(raw))){
+    const block = m[1];
+    const parts = [];
+    const tRe = /<(?:\w+:)?t\b[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/g;
+    let tm;
+    while((tm = tRe.exec(block))) parts.push(xmlDecode(tm[1]));
+    result.push(parts.join(''));
+  }
+  return result;
 }
 
 function localElements(root, localName){
@@ -170,20 +189,94 @@ function localElements(root, localName){
 async function sheetXmlToAoa(zip, path, sharedStrings, parser){
   const f = zip.file(path);
   if(!f) return [];
-  const xml = parser.parseFromString(await f.async('string'), 'application/xml');
-  const rows = localElements(xml, 'row');
+  const raw = await f.async('string');
+  let aoa = [];
+  try{
+    const xml = parser.parseFromString(raw, 'application/xml');
+    const rows = localElements(xml, 'row');
+    for(const row of rows){
+      const rIdx = Number(row.getAttribute('r') || (aoa.length+1)) - 1;
+      if(!aoa[rIdx]) aoa[rIdx] = [];
+      const cells = localElements(row, 'c');
+      for(const c of cells){
+        const ref = c.getAttribute('r') || '';
+        const cIdx = ref ? colRefToIndex(ref) : aoa[rIdx].length;
+        aoa[rIdx][cIdx] = cellValue(c, sharedStrings);
+      }
+    }
+    aoa = aoa.map(r => r || []);
+  }catch(e){
+    console.warn('sheet XML DOM parse failed, using regex fallback', e);
+  }
+  // DOMParser가 빈 값처럼 읽었거나 shared string이 해석되지 않은 경우, 원문 XML 기반 파서로 재시도합니다.
+  if(!aoaHasSalaryHeaderLikeText(aoa)){
+    const regexAoa = sheetXmlToAoaByRegex(raw, sharedStrings);
+    if(aoaScoreForHeaders(regexAoa) >= aoaScoreForHeaders(aoa)) aoa = regexAoa;
+  }
+  return aoa;
+}
+
+function aoaHasSalaryHeaderLikeText(aoa){
+  return aoaScoreForHeaders(aoa) >= 2;
+}
+function aoaScoreForHeaders(aoa){
+  const joined = (aoa || []).slice(0,80).map(r => (r||[]).map(text).join(' ')).join(' ');
+  let score = 0;
+  if(/직\s*명|직명/.test(joined)) score++;
+  if(/본봉|기본급/.test(joined)) score++;
+  if(/지급액\s*계|지급액계|지급총액|총지급액/.test(joined)) score++;
+  if(/소계\s*\(?교원\)?|소계교원/.test(joined)) score++;
+  return score;
+}
+function sheetXmlToAoaByRegex(raw, sharedStrings){
   const aoa = [];
-  for(const row of rows){
-    const rIdx = Number(row.getAttribute('r') || (aoa.length+1)) - 1;
+  const rowRe = /<(?:\w+:)?row\b([^>]*)>([\s\S]*?)<\/(?:\w+:)?row>/g;
+  let rm, implicitRow = 0;
+  while((rm = rowRe.exec(raw))){
+    const rowAttrs = rm[1] || '';
+    const body = rm[2] || '';
+    const rIdx = Number(getXmlAttr(rowAttrs, 'r') || (++implicitRow)) - 1;
+    implicitRow = Math.max(implicitRow, rIdx + 1);
     if(!aoa[rIdx]) aoa[rIdx] = [];
-    const cells = localElements(row, 'c');
-    for(const c of cells){
-      const ref = c.getAttribute('r') || '';
+    const cellRe = /<(?:\w+:)?c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/(?:\w+:)?c>)/g;
+    let cm;
+    while((cm = cellRe.exec(body))){
+      const attrs = cm[1] || '';
+      const cbody = cm[2] || '';
+      const ref = getXmlAttr(attrs, 'r') || '';
       const cIdx = ref ? colRefToIndex(ref) : aoa[rIdx].length;
-      aoa[rIdx][cIdx] = cellValue(c, sharedStrings);
+      aoa[rIdx][cIdx] = cellValueFromXml(attrs, cbody, sharedStrings);
     }
   }
   return aoa.map(r => r || []);
+}
+function getXmlAttr(attrs, name){
+  const m = String(attrs || '').match(new RegExp('(?:^|\\s)' + name + '="([^"]*)"'));
+  return m ? xmlDecode(m[1]) : '';
+}
+function cellValueFromXml(attrs, body, sharedStrings){
+  const t = getXmlAttr(attrs, 't');
+  if(t === 'inlineStr'){
+    const parts = [];
+    const tRe = /<(?:\w+:)?t\b[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/g;
+    let tm; while((tm = tRe.exec(body))) parts.push(xmlDecode(tm[1]));
+    return parts.join('');
+  }
+  const vm = body.match(/<(?:\w+:)?v\b[^>]*>([\s\S]*?)<\/(?:\w+:)?v>/);
+  const raw = vm ? xmlDecode(vm[1]) : '';
+  if(t === 's') return sharedStrings[Number(raw)] ?? '';
+  if(t === 'str') return raw;
+  if(raw !== ''){
+    const n = Number(raw);
+    return Number.isFinite(n) && /^-?\d+(\.\d+)?$/.test(raw) ? n : raw;
+  }
+  const fm = body.match(/<(?:\w+:)?f\b[^>]*>([\s\S]*?)<\/(?:\w+:)?f>/);
+  return fm ? '=' + xmlDecode(fm[1]) : '';
+}
+function xmlDecode(s){
+  return String(s ?? '')
+    .replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"')
+    .replace(/&apos;/g,"'").replace(/&amp;/g,'&');
 }
 function colRefToIndex(ref){
   const letters = String(ref).match(/[A-Z]+/i)?.[0]?.toUpperCase() || 'A';
@@ -883,8 +976,9 @@ function render(report){
       html += '<h3 class="section-title">직원 행 미리보기</h3>'+table(['행','직명','성명','본봉','지급액계'], ex.salary.staffRows.slice(0,40).map(r=>({...r,본봉:fmt(r.본봉),지급액계:fmt(r.지급액계)})), {small:true});
     } else {
       html += '<p class="bad">보수 시트를 구조적으로 읽지 못했습니다. 후보 시트의 상단 미리보기를 확인해주세요.</p>';
-      const first = ex.salaryCandidates[0]?.sheet;
-      if(first){ /* preview unavailable here if failed for nonselected; use candidate message only */ }
+      if(ex.salaryCandidates?.length){
+        html += '<p class="muted">후보 시트에서 직명/본봉/지급액계가 보이지 않으면 엑셀 저장 형식 또는 병합 헤더 문제입니다.</p>';
+      }
     }
     html += '<h3 class="section-title">퇴직 관련 시트</h3>'+table(['sheetName','positiveAmount','hasRetirementAmount'], ex.retirement.map(r=>({sheetName:r.sheetName, positiveAmount:fmt(r.positiveAmount), hasRetirementAmount:r.hasRetirementAmount?'있음':'없음'})));
     $('excelTables').innerHTML = html;
