@@ -375,17 +375,29 @@ function parseCalcLine(t){
   if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:1, amount:toNum(m[3])};
   return null;
 }
+function cleanCalcNameCandidate(raw){
+  let s = text(raw || '');
+  s = s.replace(/\(본예산\)|\(보조금및지원금\)|\(수익자부담금\)|\(그밖의수입\)/g,' ')
+       .replace(/교\s*$/,'').replace(/환\s*$/,'').replace(/운\s*$/,'').replace(/경\s*$/,'')
+       .replace(/\s+/g,' ').trim();
+  if(!s) return '';
+  if(/[0-9,]+원\s*\*/.test(s)) return '';
+  if(/예산구분|발행일|산출|과\s*목|보조금|수익자|합계/.test(s)) return '';
+  const cleaned = s.replace(/\s+/g,'');
+  if(cleaned.length < 2 || cleaned.length > 40) return '';
+  if(/^\d+$/.test(cleaned)) return '';
+  return cleaned;
+}
 function findCalcName(lines, idx){
-  for(let j=idx-1; j>=Math.max(0, idx-6); j--){
-    let s = text(lines[j]?.text || '');
-    s = s.replace(/\(본예산\)|\(보조금및지원금\)|\(수익자부담금\)|\(그밖의수입\)/g,' ')
-         .replace(/교\s*$/,'').replace(/환\s*$/,'').replace(/운\s*$/,'').replace(/경\s*$/,'')
-         .replace(/\s+/g,' ').trim();
-    if(!s) continue;
-    if(/[0-9,]+원\s*\*/.test(s)) continue;
-    if(/예산구분|발행일|산출|과\s*목/.test(s)) continue;
-    const cleaned = s.replace(/\s+/g,'');
-    if(cleaned.length >= 2 && cleaned.length <= 40) return cleaned;
+  // PDF 텍스트 추출에서는 산출항목명이 산출기초의 바로 위에 오기도 하고,
+  // 바로 아래에 오기도 합니다. 한쪽 방향만 보면 직원방학휴가비처럼
+  // 다른 항목명과 잘못 매칭되는 문제가 있어 가까운 양방향 후보를 봅니다.
+  const offsets = [1,-1,2,-2,3,-3,4,-4,5,-5,6,-6];
+  for(const off of offsets){
+    const j = idx + off;
+    if(j < 0 || j >= lines.length) continue;
+    const cand = cleanCalcNameCandidate(lines[j]?.text || '');
+    if(cand) return cand;
   }
   return '';
 }
@@ -492,7 +504,16 @@ function allowanceGroupCandidates(groupRow, kind){
 }
 function findAllowancePdfMatches(kind, allowanceName, amount, pdfItems){
   const key = allowanceKey(allowanceName);
-  return pdfItems.filter(x=>x.구분==='산출기초' && allowancePdfHit(kind, key, amount, x));
+  return pdfItems.filter(x=>{
+    if(x.구분 !== '산출기초') return false;
+    if(!allowancePdfHit(kind, key, amount, x)) return false;
+    // 같은 명칭이어도 PDF 추출이 엇갈린 경우를 막기 위해 금액도 함께 확인합니다.
+    // 다만 PDF가 같은 항목을 재원별로 나눈 경우에는 합산 단계에서 처리되므로
+    // 개별 산출기초 금액이 엑셀금액 이하인 경우까지 허용합니다.
+    const pdfAmt = Number(x.PDF금액 || 0);
+    const excelAmt = Number(amount || 0);
+    return !excelAmt || closeMoney(pdfAmt, excelAmt) || pdfAmt <= excelAmt;
+  });
 }
 function integratedText(kind, list, amountField, groupLabel, groupAmount){
   const expr = list.map(a=>`${a.항목}(${fmt(a[amountField])})`).join(' + ');
