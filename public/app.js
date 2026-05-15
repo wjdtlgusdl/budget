@@ -638,12 +638,37 @@ function extractBudgetItems(lines){
   return out.filter(x=>!LEGAL_RE.test(x.항목));
 }
 function parseTotalBudgetRow(t){
-  if(/산출|예산구분|발행일|과\s*목|보조금|수익자/.test(t)) return null;
-  const m = t.match(/^\s*([^0-9=]{2,40}?)\s+([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)\s+([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)\s+([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)\s+([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)\s*$/);
-  if(!m) return null;
-  const name = text(m[1]).replace(/\s+/g,'').trim();
-  if(!name || /본예산|단위|천원/.test(name)) return null;
-  return {항목:name, 보조금:toNum(m[2])*1000, 수익자:toNum(m[3])*1000, 기타:toNum(m[4])*1000, 금액:toNum(m[5])*1000};
+  if(/산출|예산구분|발행일|과\s*목|보조금\s*및|수익자\s*부담|예산액\s*전년도|비교\s*증감/.test(t)) return null;
+  const raw = text(t).replace(/−/g,'-').replace(/\s+/g,' ').trim();
+  if(!raw) return null;
+
+  // ① 행복한아이들 등: 보조금/수익자/기타/합계 4개 금액 열
+  let m = raw.match(/^\s*([^0-9=]{2,60}?)\s+(-?[0-9]{1,3}(?:,[0-9]{3})*|-?[0-9]+)\s+(-?[0-9]{1,3}(?:,[0-9]{3})*|-?[0-9]+)\s+(-?[0-9]{1,3}(?:,[0-9]{3})*|-?[0-9]+)\s+(-?[0-9]{1,3}(?:,[0-9]{3})*|-?[0-9]+)\s*$/);
+  if(m){
+    const name = normalizeMokName(text(m[1]));
+    if(!validBudgetRowName(name)) return null;
+    return {항목:name, 보조금:toNum(m[2])*1000, 수익자:toNum(m[3])*1000, 기타:toNum(m[4])*1000, 금액:toNum(m[5])*1000, 형식:'재원별'};
+  }
+
+  // ② 신동탄재크와콩나무 등: 예산액/전년도예산액/비교증감 3개 금액 열
+  // 이 형식에서는 첫 번째 숫자가 현재 예산액입니다.
+  m = raw.match(/^\s*([^0-9=]{2,80}?)\s+(-?[0-9]{1,3}(?:,[0-9]{3})*|-?[0-9]+)\s+(-?[0-9]{1,3}(?:,[0-9]{3})*|-?[0-9]+)\s+(-?[0-9]{1,3}(?:,[0-9]{3})*|-?[0-9]+)\s*$/);
+  if(m){
+    const name = normalizeMokName(text(m[1]));
+    if(!validBudgetRowName(name)) return null;
+    return {항목:name, 보조금:0, 수익자:0, 기타:0, 금액:toNum(m[2])*1000, 전년도금액:toNum(m[3])*1000, 비교증감:toNum(m[4])*1000, 형식:'예산액'};
+  }
+  return null;
+}
+function normalizeMokName(s){
+  return text(s).replace(/\s+/g,'').replace(/^[|:：·ㆍ]+|[|:：·ㆍ]+$/g,'').trim();
+}
+function validBudgetRowName(name){
+  if(!name) return false;
+  if(name.length < 2 || name.length > 35) return false;
+  if(/본예산|단위|천원|예산구분|회계연도|학교명|세입|세출|총괄표|김담은|경기도교육청/.test(name)) return false;
+  if(/^[\d,\-]+$/.test(name)) return false;
+  return true;
 }
 function parseCalcLine(t){
   const compact = t.replace(/\s+/g,'');
