@@ -62,43 +62,104 @@ $('downloadBtn').addEventListener('click', () => {
 async function parseExcel(file){
   const originalBuf = await file.arrayBuffer();
 
-  // 1순위: XLSX 내부 XML 직접 파싱. HCell/한컴 계열 파일에서 SheetJS가 빈 시트로 읽는 경우를 보정합니다.
-  let rawBook = null;
+  // v34 핵심 변경:
+  // - 한컴/HCell 계열 XLSX는 SheetJS가 빈 시트처럼 읽는 경우가 있어 raw-xlsx-xml 파서가 필요합니다.
+  // - 반대로 MS Excel/기관별 서식 파일은 SheetJS가 더 안정적으로 읽는 경우가 있습니다.
+  // - 따라서 두 경로를 모두 시도하고, 보수표 구조를 실제로 읽은 쪽을 선택합니다.
+  const attempts = [];
+
+  // A. SheetJS 경로 먼저 시도: 일반 Excel 파일, 넓은 열 범위(IX 등), 표준 sharedStrings 파일에 강함
   try{
-    rawBook = await readXlsxRawWorkbook(originalBuf);
+    const sheetReport = await parseExcelWithSheetJS(file.name, originalBuf);
+    attempts.push(sheetReport);
   }catch(e){
-    console.warn('Raw XLSX parser failed, falling back to SheetJS:', e);
+    attempts.push({parser:'sheetjs', error:e.message, salaryCandidates:[], salary:null, visibleSheets:[]});
+    console.warn('SheetJS parse failed:', e);
   }
 
-  if(rawBook){
-    const visible = rawBook.sheets.filter(s=>!s.hidden);
-    const candidates = visible.map(s=>({ ...s, score: sheetScore(s.name) }))
-      .filter(s=>s.score>0).sort((a,b)=>b.score-a.score);
-    let salary = null;
-    const tried = [];
-    for(const c of candidates){
-      const aoa = await rawBook.getAoa(c.name);
-      const parsed = parseSalarySheet(c.name, aoa);
-      tried.push({sheet:c.name, score:c.score, found:!!parsed.ok, message:parsed.message || ''});
-      if(parsed.ok){ salary = parsed; break; }
-    }
-    const retireSheets = visible
-      .filter(s=>RETIRE_RE.test(s.name))
-      .map(async s=>parseRetireSheet(s.name, await rawBook.getAoa(s.name)));
-    const retireSheetsResolved = await Promise.all(retireSheets);
-    return {
-      fileName:file.name,
-      parser:'raw-xlsx-xml',
-      visibleSheets:visible.map(s=>s.name),
-      salaryCandidates:tried,
-      salary,
-      retirement:retireSheetsResolved
-    };
+  // B. raw XML 경로 시도: HCell/한컴 계열에서 SheetJS가 빈 시트로 읽는 문제 보정
+  try{
+    const rawReport = await parseExcelWithRawXml(file.name, originalBuf);
+    attempts.push(rawReport);
+  }catch(e){
+    attempts.push({parser:'raw-xlsx-xml', error:e.message, salaryCandidates:[], salary:null, visibleSheets:[]});
+    console.warn('Raw XLSX parser failed:', e);
   }
 
-  // 2순위: 일반 XLSX 파일은 SheetJS 경로로 읽습니다.
+  // C. 선택 기준: salary가 정상인 결과 우선, 그 다음 후보 진단이 더 풍부한 결과
+  const successful = attempts.filter(x=>x && x.salary && x.salary.ok);
+  let chosen = successful[0];
+  if(successful.length > 1){
+    // (년) 시트/보수일람표를 읽은 결과를 우선
+    chosen = successful.sort((a,b)=>{
+      const as = selectedSalaryScore(a), bs = selectedSalaryScore(b);
+      return bs-as;
+    })[0];
+  }
+  if(!chosen){
+    chosen = attempts.sort((a,b)=>(b.salaryCandidates?.length||0)-(a.salaryCandidates?.length||0))[0] || {fileName:file.name};
+  }
+  chosen.fileName = file.name;
+  chosen.parserAttempts = attempts.map(a=>({
+    parser:a.parser,
+    error:a.error||'',
+    visibleSheets:a.visibleSheets||[],
+    salaryFound:!!(a.salary&&a.salary.ok),
+    salarySheet:a.salary?.sheetName||'',
+    candidates:a.salaryCandidates||[]
+  }));
+  return chosen;
+}
+
+function selectedSalaryScore(report){
+  const name = report.salary?.sheetName || '';
+  let score = 0;
+  if(/교직원보수일람표/.test(name)) score += 100;
+  if(/\(년\)|년간|연간/.test(name)) score += 50;
+  if(/\(월\)|월간|월급여/.test(name)) score -= 20;
+  if(report.parser === 'raw-xlsx-xml') score += 5;
+  if(report.parser === 'sheetjs') score += 3;
+  return score;
+}
+
+async function parseExcelWithRawXml(fileName, originalBuf){
+  const rawBook = await readXlsxRawWorkbook(originalBuf);
+  const visible = rawBook.sheets.filter(s=>!s.hidden);
+  const candidates = visible.map(s=>({ ...s, score: sheetScore(s.name) }))
+    .filter(s=>s.score>0).sort((a,b)=>b.score-a.score);
+  let salary = null;
+  const tried = [];
+  for(const c of candidates){
+    const aoa = await rawBook.getAoa(c.name);
+    const parsed = parseSalarySheet(c.name, aoa);
+    tried.push({sheet:c.name, score:c.score, found:!!parsed.ok, message:parsed.message || '', parser:'raw-xlsx-xml'});
+    if(parsed.ok){ salary = parsed; break; }
+  }
+  const retireSheets = visible
+    .filter(s=>RETIRE_RE.test(s.name))
+    .map(async s=>parseRetireSheet(s.name, await rawBook.getAoa(s.name)));
+  const retireSheetsResolved = await Promise.all(retireSheets);
+  return {
+    fileName,
+    parser:'raw-xlsx-xml',
+    visibleSheets:visible.map(s=>s.name),
+    salaryCandidates:tried,
+    salary,
+    retirement:retireSheetsResolved
+  };
+}
+
+async function parseExcelWithSheetJS(fileName, originalBuf){
   const normalizedBuf = await normalizeXlsxForSheetJS(originalBuf);
-  const wb = XLSX.read(normalizedBuf, { type:'array', cellDates:false, cellNF:false, cellText:true, raw:false, WTF:false });
+  const wb = XLSX.read(normalizedBuf, {
+    type:'array',
+    cellDates:false,
+    cellNF:false,
+    cellText:true,
+    raw:false,
+    WTF:false,
+    dense:false
+  });
   const sheetMeta = (wb.Workbook && wb.Workbook.Sheets) || [];
   const visible = wb.SheetNames.map((name,i)=>({name, hidden: sheetMeta[i]?.Hidden || 0})).filter(s=>!s.hidden);
   const candidates = visible.map(s=>({ ...s, score: sheetScore(s.name) })).filter(s=>s.score>0).sort((a,b)=>b.score-a.score);
@@ -106,13 +167,35 @@ async function parseExcel(file){
   const tried = [];
   for(const c of candidates){
     const ws = wb.Sheets[c.name];
-    const aoa = XLSX.utils.sheet_to_json(ws, {header:1, raw:false, defval:''});
+    const aoa = sheetToAoaRobust(ws);
     const parsed = parseSalarySheet(c.name, aoa);
-    tried.push({sheet:c.name, score:c.score, found:!!parsed.ok, message:parsed.message || ''});
+    tried.push({sheet:c.name, score:c.score, found:!!parsed.ok, message:parsed.message || '', parser:'sheetjs'});
     if(parsed.ok){ salary = parsed; break; }
   }
-  const retireSheets = visible.filter(s=>RETIRE_RE.test(s.name)).map(s=>parseRetireSheet(s.name, XLSX.utils.sheet_to_json(wb.Sheets[s.name], {header:1, raw:false, defval:''})));
-  return { fileName:file.name, parser:'sheetjs', visibleSheets:visible.map(s=>s.name), salaryCandidates:tried, salary, retirement:retireSheets };
+  const retireSheets = visible
+    .filter(s=>RETIRE_RE.test(s.name))
+    .map(s=>parseRetireSheet(s.name, sheetToAoaRobust(wb.Sheets[s.name])));
+  return { fileName, parser:'sheetjs', visibleSheets:visible.map(s=>s.name), salaryCandidates:tried, salary, retirement:retireSheets };
+}
+
+function sheetToAoaRobust(ws){
+  if(!ws || !ws['!ref']) return [];
+  // defval을 유지하되, 매우 넓은 IX 범위 같은 시트에서도 필요한 실제 값은 빠지지 않도록 SheetJS 기본 변환 사용
+  let aoa = XLSX.utils.sheet_to_json(ws, {header:1, raw:false, defval:''});
+  // 어떤 셀은 .w에는 표시값이 있고 .v가 빈 경우가 있어 직접 보완합니다.
+  const range = XLSX.utils.decode_range(ws['!ref']);
+  for(let R=range.s.r; R<=Math.min(range.e.r, 120); ++R){
+    if(!aoa[R]) aoa[R] = [];
+    for(let C=range.s.c; C<=Math.min(range.e.c, 260); ++C){
+      if(aoa[R][C] !== undefined && aoa[R][C] !== '') continue;
+      const addr = XLSX.utils.encode_cell({r:R,c:C});
+      const cell = ws[addr];
+      if(cell){
+        aoa[R][C] = cell.w ?? cell.v ?? '';
+      }
+    }
+  }
+  return aoa;
 }
 
 async function readXlsxRawWorkbook(buf){
