@@ -429,7 +429,7 @@ function addOffMokDiffIssues(issues, calcs, checks){
     const matches = findOffMokMatches(calcs, c.expectedMok, diff, c.category);
     for(const x of matches){
       const kind = /교원/.test(c.category) ? '교원' : /직원/.test(c.category) ? '직원' : '해당';
-      const text = `${x.항목} ${shortWon(x.PDF금액)}을 ${c.expectedMok} 목이 아닌 ${x.목 || x.상위항목} 목의 산출내역에 편성`;
+      const text = `${cleanItemName(x.항목)} ${shortWon(x.PDF금액)}을 ${c.expectedMok} 목이 아닌 ${x.목 || x.상위항목} 목의 산출내역에 편성`;
       const basis = `${c.category} 차액 ${fmt(Math.abs(diff))}과 일치. PDF ${x.페이지}쪽: ${x.산출기초}`;
       const key = text + '|' + basis;
       if(seen.has(key)) continue;
@@ -456,11 +456,19 @@ function pdfPeopleKey(x){
   if(/조리.*급여/.test(raw)) return '조리직원급여';
   if(/환경.*급여|미화.*급여/.test(raw)) return '환경미화원급여';
   if(/보조교사.*급여/.test(raw)) return '보조교사급여';
-  if(/차량기사.*급여/.test(raw)) return '차량기사급여';
+  if(/차량기사.*급여|량기사.*급여/.test(raw)) return '차량기사급여';
   if(/차량보조.*급여/.test(raw)) return '차량보조급여';
   if(/영양사.*급여|영양사.*인건비/.test(raw)) return '영양사급여';
   return allowanceKey(x?.항목 || '') || norm(x?.항목 || x?.목 || '');
 }
+
+function cleanItemName(name){
+  let s = String(name || '').trim();
+  if(/^량기사/.test(s)) s = '차' + s;
+  if(/^량보조/.test(s)) s = '차' + s;
+  return s;
+}
+
 function sumPeopleDistinct(items){
   const byName = new Map();
   for(const x of items){
@@ -480,7 +488,7 @@ function detailVerdict(label, excelAmount, pdfAmount, excelPeople, pdfPeople, of
     const diff=ea-pa;
     if(offMatches && offMatches.length){
       const m=offMatches[0];
-      parts.push(`금액 차이(${label} ${shortWon(Math.abs(diff))} 차이 → ${m.목 || m.상위항목} 목에 ${m.항목} ${fmt(m.PDF금액)} 편성)`);
+      parts.push(`금액 차이(${label} ${shortWon(Math.abs(diff))} 차이 → ${m.목 || m.상위항목} 목에 ${cleanItemName(m.항목)} ${fmt(m.PDF금액)} 편성)`);
     }else{
       parts.push(`금액 차이(엑셀 ${fmt(ea)} / PDF ${fmt(pa)} / 차이 ${fmt(Math.abs(diff))})`);
     }
@@ -602,6 +610,7 @@ function buildPrecheck(report){
       rows.push({구분:'수당', 항목:d.항목, 엑셀금액:d.엑셀금액, 엑셀인원:d.엑셀인원, PDF금액:d.PDF금액, PDF인원:d.PDF인원, 검토결과:d.검토결과});
     }
 
+    /* v30: 지적사항 표는 퇴직적립금 관련 사항만 표시합니다. 차액/다른 목 편성은 검토결과 열에 표시합니다.
     addOffMokDiffIssues(issues, calcs, [
       {category:'교원급여', expectedMok:'교원급여', excelAmount:teacherBase, pdfAmount:teacherPayTotal},
       {category:'교원수당', expectedMok:'교원수당', excelAmount:teacherAnalysis.totalExcel, pdfAmount:teacherAnalysis.groupMatchedAmount || teacherAnalysis.groupTotal},
@@ -610,27 +619,10 @@ function buildPrecheck(report){
     ]);
 
     addMissingAllowanceIssues(issues, teacherAnalysis, staffAnalysis);
+    */
   }
 
-  const laborRe = /(급여|인건비|보수|상여금|수당)$/;
-  const specificLaborRe = /(원장|교원|교사|방과후|사무|조리|영양사|보조교사|차량기사|차량보조|환경미화|직원).*(급여|인건비|보수)|차량기사급여|영양사인건비|영양사급여/;
-  const allowedMokRe = /(교원급여|교원수당|직원급여|직원수당|그밖의인건비|교원인건비|직원인건비)/;
-  const wrongMap = new Map();
-  for(const issue of issues){ wrongMap.set(issue.지적내용, true); }
-  for(const x of calcs){
-    if(!x || !x.항목 || !x.PDF금액) continue;
-    if(LEGAL_RE.test(x.항목)) continue;
-    if(/퇴직|적립금/.test(x.항목)) continue;
-    const isLabor = specificLaborRe.test(x.항목) || (laborRe.test(x.항목) && /(명\*|명)/.test(x.산출기초 || ''));
-    if(!isLabor) continue;
-    const mok = x.목 || x.상위항목 || '';
-    if(!mok || allowedMokRe.test(mok)) continue;
-    const textIssue = `${x.항목} ${shortWon(x.PDF금액)}을 직원·교원 인건비 목이 아닌 ${mok} 목의 산출내역에 편성`;
-    const key = `${x.항목}|${mok}|${x.PDF금액}`;
-    if(wrongMap.has(key) || wrongMap.has(textIssue)) continue;
-    wrongMap.set(key, x); wrongMap.set(textIssue, true);
-    addIssue(textIssue, `PDF ${x.페이지}쪽: ${x.산출기초}`);
-  }
+  // v30: 일반 오편성/미편성 지적사항은 결과표 검토결과 열에만 표시하고, 지적사항 표에는 퇴직적립금만 표시합니다.
 
   const excelRetire = (report.excel?.retirement || []).some(r=>r.hasRetirementAmount);
   const pdfRetire = pdfItems.some(x=>/퇴직.*적립|퇴직금|퇴직급여|퇴직충당/.test(x.항목));
@@ -666,13 +658,19 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupRowOrTotal){
   const totalExcel = relevant.reduce((s,a)=>s+Number(a[amountField]||0),0);
   const missingSum = missing.reduce((s,a)=>s+Number(a[amountField]||0),0);
   const directSum = direct.reduce((s,a)=>s+Number(a[amountField]||0),0);
+  const directPdfSum = details
+    .filter(d => /^개별편성/.test(d.검토결과 || ''))
+    .reduce((s,d)=>s+Number(d.PDF금액||0),0);
+  const residual = Math.max(0, groupTotal - directPdfSum);
   const candidates = allowanceGroupCandidates(groupRow, kind);
+  if(residual) candidates.unshift({label:`${kind}수당 잔액`, amount:residual});
   let matched = null;
+  // 미개별 수당이 있으면 전체 수당 총액이 아니라 "교원/직원수당 총액 - 이미 개별확인된 금액" 또는 미개별 수당 합계와 비교합니다.
   if(missingSum) matched = candidates.find(c=>closeMoney(c.amount, missingSum));
-  if(!matched && totalExcel) matched = candidates.find(c=>closeMoney(c.amount, totalExcel));
-  if(!matched && totalExcel-directSum) matched = candidates.find(c=>closeMoney(c.amount, totalExcel-directSum));
+  // 미개별 수당이 없는 경우에만 전체 수당 총액 일치를 인정합니다.
+  if(!matched && !missing.length && totalExcel) matched = candidates.find(c=>closeMoney(c.amount,totalExcel));
   const coveredByGroup = !!matched;
-  const integratedMessage = coveredByGroup && missing.length ? integratedText(kind, missing, amountField, matched.label, matched.amount) : '';
+  const integratedMessage = coveredByGroup && missing.length ? integratedText(kind, missing, amountField, `${kind}수당`, matched.amount) : '';
 
   for(const a of missing){
     const amount = Number(a[amountField]||0);
@@ -685,7 +683,7 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupRowOrTotal){
 
   let verdict = '';
   if(integratedMessage) verdict = integratedMessage;
-  else if(totalExcel && candidates.some(c=>closeMoney(c.amount,totalExcel))) verdict = `총액 일치 또는 통합편성(${fmt(totalExcel)} ≒ ${kind}수당 ${fmt(groupTotal)})`;
+  else if(!missing.length && totalExcel && candidates.some(c=>closeMoney(c.amount,totalExcel))) verdict = `총액 일치 또는 통합편성(${fmt(totalExcel)} ≒ ${kind}수당 ${fmt(groupTotal)})`; 
   else if(missingSum && !groupTotal) verdict = `추가확인필요: PDF ${kind}수당 총액행 없음, 미개별표시 수당 ${fmt(missingSum)}`;
   else if(missingSum) verdict = `추가확인필요: 미개별표시 수당 합계 ${fmt(missingSum)}, PDF ${kind}수당 ${fmt(groupTotal)}`;
   else verdict = '개별 또는 총액 확인';
