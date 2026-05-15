@@ -176,7 +176,7 @@ async function sheetXmlToAoa(zip, path, sharedStrings, parser){
   for(const row of rows){
     const rIdx = Number(row.getAttribute('r') || (aoa.length+1)) - 1;
     if(!aoa[rIdx]) aoa[rIdx] = [];
-    const cells = Array.from(row.children).filter(el=>el.localName === 'c');
+    const cells = localElements(row, 'c');
     for(const c of cells){
       const ref = c.getAttribute('r') || '';
       const cIdx = ref ? colRefToIndex(ref) : aoa[rIdx].length;
@@ -278,6 +278,8 @@ function parseSalarySheet(sheetName, aoa){
   return {ok:true, sheetName, header:{headerRow:headerRow+1, jobCol:jobCol+1, nameCol:nameCol+1, baseCol:baseCol+1, totalCol:totalCol+1, allowanceCols:allowanceCols.map(x=>({열:x.col+1, 이름:x.name}))}, ranges:{teacherStart:headerRow+2, teacherEnd:teacherEnd>=0?teacherEnd+1: null, staffStart:teacherEnd>=0?teacherEnd+2:headerRow+2, staffEnd:staffEnd>=0?staffEnd+1:null}, summary, teacherRows, staffRows, teacherSubtotal, staffSubtotal, preview};
 }
 function detectSalaryHeader(aoa, maxRows, maxCols){
+  const direct = detectSalaryHeaderDirect(aoa, maxRows, maxCols);
+  if(direct.ok) return direct;
   let best = null;
   for(let r=0; r<maxRows; r++){
     const rowWindow = [];
@@ -287,7 +289,7 @@ function detectSalaryHeader(aoa, maxRows, maxCols){
     const jobCol = findColInTexts(rowWindow, [/^직명$/, /직\s*명/]);
     const nameCol = findColInTexts(rowWindow, [/^성\s*명$/, /성\s*명/]);
     const baseCol = findColInTexts(rowWindow, [/본봉/, /기본급/]);
-    const totalCol = findColInTexts(rowWindow, [/지급액계/, /지급액\s*계/, /월지급액계/]);
+    const totalCol = findColInTexts(rowWindow, [/지급액계/, /지급액\s*계/, /월지급액계/, /지급총액/, /총지급액/]);
     let score = 0;
     if(jobCol>=0) score+=4; if(baseCol>=0) score+=4; if(totalCol>=0) score+=4; if(nameCol>=0) score+=1;
     if(baseCol>=0 && totalCol>baseCol) score+=3;
@@ -302,7 +304,7 @@ function detectSalaryHeader(aoa, maxRows, maxCols){
     jobCol: findColInTexts(colText, [/^직명$/, /직\s*명/]),
     nameCol: findColInTexts(colText, [/^성\s*명$/, /성\s*명/]),
     baseCol: findColInTexts(colText, [/본봉/, /기본급/]),
-    totalCol: findColInTexts(colText, [/지급액계/, /지급액\s*계/, /월지급액계/]),
+    totalCol: findColInTexts(colText, [/지급액계/, /지급액\s*계/, /월지급액계/, /지급총액/, /총지급액/]),
     score: 0
   };
   if(colDetected.jobCol>=0) colDetected.score+=3;
@@ -318,6 +320,36 @@ function detectSalaryHeader(aoa, maxRows, maxCols){
   }
   return {ok:true, ...picked};
 }
+
+function detectSalaryHeaderDirect(aoa, maxRows, maxCols){
+  // 보수표는 기관마다 병합/다중행 헤더가 달라도 보통 한 행 안에 직명·본봉·지급액계가 존재합니다.
+  // 먼저 상단 80행 전체에서 각 셀 단위로 가장 직접적인 헤더를 찾습니다.
+  const cols = {jobCol:-1, nameCol:-1, baseCol:-1, totalCol:-1};
+  let headerRow = -1;
+  const scanRows = Math.min(maxRows, 80);
+  for(let r=0; r<scanRows; r++){
+    for(let c=0; c<maxCols; c++){
+      const v = norm(text(aoa[r]?.[c]));
+      if(!v) continue;
+      if(cols.jobCol<0 && /^직명$|직\s*명/.test(v)){ cols.jobCol=c; headerRow = headerRow<0?r:Math.max(headerRow,r); }
+      if(cols.nameCol<0 && /^성명$|성\s*명/.test(v)){ cols.nameCol=c; }
+      if(cols.baseCol<0 && /본봉|기본급/.test(v)){ cols.baseCol=c; headerRow = headerRow<0?r:Math.max(headerRow,r); }
+      if(cols.totalCol<0 && /(지급액계|지급액\s*계|월지급액계|지급총액|총지급액)/.test(v)){ cols.totalCol=c; headerRow = headerRow<0?r:Math.max(headerRow,r); }
+    }
+  }
+  // 어떤 파일은 '지급액계'가 아닌 '지급액 계'가 줄바꿈으로 분리됩니다. 열 전체 텍스트로 한 번 더 찾습니다.
+  const colText = Array.from({length:maxCols},(_,c)=>norm(columnText(aoa,c,scanRows)));
+  if(cols.jobCol<0) cols.jobCol = findColInTexts(colText, [/^직명$/, /직\s*명/]);
+  if(cols.nameCol<0) cols.nameCol = findColInTexts(colText, [/^성명$/, /성\s*명/]);
+  if(cols.baseCol<0) cols.baseCol = findColInTexts(colText, [/본봉/, /기본급/]);
+  if(cols.totalCol<0) cols.totalCol = findColInTexts(colText, [/지급액계/, /지급액\s*계/, /월지급액계/, /지급총액/, /총지급액/, /지급총액/, /총지급액/]);
+  if(headerRow<0) headerRow = findHeaderRow(aoa, [cols.jobCol, cols.baseCol, cols.totalCol]);
+  if(cols.jobCol>=0 && cols.baseCol>=0 && cols.totalCol>cols.baseCol){
+    return {ok:true, headerRow, jobCol:cols.jobCol, nameCol:cols.nameCol, baseCol:cols.baseCol, totalCol:cols.totalCol, score:99};
+  }
+  return {ok:false};
+}
+
 function columnText(aoa, c, maxRows=80){
   return aoa.slice(0,maxRows).map(r=>r?.[c]).map(text).filter(Boolean).join(' ');
 }
@@ -343,7 +375,7 @@ function findHeaderRow(aoa, cols){
     const all=r.map(text).join(' ');
     if(/직\s*명/.test(all))s+=3;
     if(/본봉|기본급/.test(all))s+=3;
-    if(/지급액계|지급액\s*계/.test(all))s+=3;
+    if(/지급액계|지급액\s*계|지급총액|총지급액/.test(all))s+=3;
     if(/소득세|실수령액|공제액/.test(all))s+=1;
     if(s>score){score=s;best=i;}
   });
