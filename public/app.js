@@ -463,12 +463,9 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupTotal){
   const direct = [];
   const missing = [];
   for(const a of relevant){
+    const amount = Number(a[amountField]||0);
     const key = allowanceKey(a.항목);
-    const hit = key && pdfItems.some(x=>{
-      const k2 = allowanceKey(x.항목);
-      if(!k2) return false;
-      return k2.includes(key) || key.includes(k2);
-    });
+    const hit = key && pdfItems.some(x=>allowancePdfHit(kind, key, amount, x));
     (hit ? direct : missing).push(a);
   }
   const totalExcel = relevant.reduce((s,a)=>s+a[amountField],0);
@@ -482,6 +479,43 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupTotal){
   else if(missingSum) verdict = `추가확인필요: 미개별표시 수당 합계 ${fmt(missingSum)}, PDF ${kind}수당 ${fmt(groupTotal)}`;
   else verdict = '개별 또는 총액 확인';
   return {kind, amountField, relevant, direct, missing, totalExcel, missingSum, directSum, groupTotal:Number(groupTotal||0), coveredByGroup, verdict};
+}
+
+function allowancePdfHit(kind, key, amount, x){
+  if(!x || !key) return false;
+  if(LEGAL_RE.test(x.항목||'')) return false;
+  const mok = norm(x.목 || x.상위항목 || '');
+  const item = norm(x.항목 || '');
+  const calc = norm(x.산출기초 || '');
+  const combined = item + ' ' + calc;
+  const k2 = allowanceKey(x.항목 || '');
+
+  // 교원 수당은 교원수당 목 또는 교원 접두 항목에서, 직원 수당은 직원수당 목 또는 직원 접두 항목에서 우선 찾습니다.
+  const allowanceMok = kind === '교원' ? '교원수당' : '직원수당';
+  const kindOk = kind === '교원'
+    ? (mok.includes('교원수당') || item.startsWith('교원') || item.includes('교사') || !mok.includes('직원수당'))
+    : (mok.includes('직원수당') || item.startsWith('직원') || !mok.includes('교원수당'));
+  if(!kindOk) return false;
+
+  // 식대 ↔ 정액급식비 동의어는 교원/직원 수당 목 안에서만 적용합니다.
+  // 일반급식비, 특별급식비, 식재료비, 교직원식재료비 등은 식대와 별개입니다.
+  const isMealKey = key === '정액급식' || k2 === '정액급식';
+  if(isMealKey){
+    const scopedMeal = mok.includes(allowanceMok) || item.includes(kind + '정액급식') || item.includes(kind + '식대');
+    if(!scopedMeal) return false;
+  }
+
+  // 1) 명칭 정규화 매칭: 교원성과상여금 ↔ 성과상여금, 교원정액급식비 ↔ 식대 등
+  if(k2 && (k2.includes(key) || key.includes(k2))) return true;
+
+  // 2) PDF 산출항목명이 목명으로 뭉개진 경우를 대비해, 같은 수당 목 안에서 금액까지 일치하면 편성된 것으로 봅니다.
+  if(amount && Number(x.PDF금액||0) === amount){
+    if(mok.includes(allowanceMok)) return true;
+  }
+
+  // 3) 산출기초 주변 텍스트에 동의어가 있는 경우도 인정합니다.
+  if(combined && combined.includes(key)) return true;
+  return false;
 }
 
 function addMissingAllowanceIssues(issues, teacherAnalysis, staffAnalysis){
@@ -507,7 +541,21 @@ function allowanceVerdict(kind, allowanceRows, pdfItems, groupTotal){
   return analyzeAllowances(kind, allowanceRows, pdfItems, groupTotal).verdict;
 }
 function allowanceKey(s){
-  return norm(s).replace(/수당|보조금|지원비|비/g,'');
+  let k = norm(s);
+  if(!k) return '';
+  // 소속/직종 접두어는 같은 항목 매칭에서 제외합니다.
+  k = k.replace(/^(교원|직원|교사|사무직원|조리직원|보조교사)/,'');
+
+  // 기관마다 다른 명칭을 같은 수당으로 봅니다.
+  if(/^(식대|급식비|정액급식비|정액급식|급식수당)$/.test(k) || /정액급식/.test(k)) return '정액급식';
+  if(/성과상여/.test(k)) return '성과상여';
+  if(/명절휴가/.test(k)) return '명절휴가';
+  if(/스승의날/.test(k)) return '스승의날상여';
+  if(/방학휴가/.test(k)) return '방학휴가';
+  if(/자가운전|자가차량|차량유지/.test(k)) return '자가운전';
+  if(/직책급|직책/.test(k)) return '직책급';
+
+  return k.replace(/수당|보조금|지원비|지원금|상여금|휴가비|급식비|식대|비/g,'');
 }
 
 function render(report){
