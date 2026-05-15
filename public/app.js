@@ -18,6 +18,13 @@ function toNum(v){
   const n = Number(s); return isFinite(n) ? n : 0;
 }
 function fmt(n){ if(n === null || n === undefined || n === '') return '-'; return Number(n).toLocaleString('ko-KR') + '원'; }
+function closeMoney(a,b,tol=1000){
+  a = Number(a||0); b = Number(b||0);
+  if(!a && !b) return true;
+  return Math.abs(a-b) <= tol;
+}
+function amountDiff(a,b){ return Math.round(Number(a||0) - Number(b||0)); }
+function shortWon(n){ return Math.abs(n) >= 10000 ? Math.round(n/10000).toLocaleString('ko-KR') + '만원' : fmt(n); }
 function table(headers, rows, opts={}){
   if(!rows || !rows.length) return '<p class="muted">표시할 데이터가 없습니다.</p>';
   const head = '<tr>'+headers.map(h=>`<th>${h}</th>`).join('')+'</tr>';
@@ -383,6 +390,43 @@ function findCalcName(lines, idx){
   return '';
 }
 
+
+function findOffMokMatches(calcs, expectedMok, diff, category){
+  const absDiff = Math.abs(Number(diff||0));
+  if(absDiff <= 1000) return [];
+  const target = norm(expectedMok);
+  const categoryNorm = norm(category || expectedMok);
+  const isPay = /급여/.test(category);
+  const isAllowance = /수당/.test(category);
+  return calcs.filter(x=>{
+    if(!x || !x.PDF금액) return false;
+    if(LEGAL_RE.test(x.항목 || '')) return false;
+    const mok = norm(x.목 || x.상위항목 || '');
+    if(!mok || mok.includes(target)) return false;
+    if(!closeMoney(Math.abs(x.PDF금액), absDiff)) return false;
+    const label = norm((x.항목 || '') + ' ' + (x.산출기초 || ''));
+    if(isPay) return /(급여|인건비|보수)/.test(label);
+    if(isAllowance) return /(수당|상여|휴가비|식대|정액급식|자가운전|직급|직책|연구|관리업무)/.test(label);
+    return true;
+  });
+}
+function addOffMokDiffIssues(issues, calcs, checks){
+  const seen = new Set(issues.map(i=>i.지적내용 + '|' + i.근거));
+  for(const c of checks){
+    const diff = amountDiff(c.excelAmount, c.pdfAmount);
+    const matches = findOffMokMatches(calcs, c.expectedMok, diff, c.category);
+    for(const x of matches){
+      const kind = /교원/.test(c.category) ? '교원' : /직원/.test(c.category) ? '직원' : '해당';
+      const text = `${x.항목} ${shortWon(x.PDF금액)}을 ${c.expectedMok} 목이 아닌 ${x.목 || x.상위항목} 목의 산출내역에 편성`;
+      const basis = `${c.category} 차액 ${fmt(Math.abs(diff))}과 일치. PDF ${x.페이지}쪽: ${x.산출기초}`;
+      const key = text + '|' + basis;
+      if(seen.has(key)) continue;
+      seen.add(key);
+      issues.push({번호:issues.length+1, 지적내용:text, 근거:basis});
+    }
+  }
+}
+
 function buildPrecheck(report){
   const rows=[];
   const issues=[];
@@ -396,7 +440,7 @@ function buildPrecheck(report){
   const peopleByCalc = (re) => calcByName(re).reduce((s,x)=>s+(x.인원||0),0);
   const addIssue = (지적내용, 근거) => issues.push({번호:issues.length+1, 지적내용, 근거});
   const verdict = (excelAmount, pdfAmount, excelPeople, pdfPeople) => {
-    const amountOk = Number(excelAmount||0) === Number(pdfAmount||0);
+    const amountOk = closeMoney(excelAmount, pdfAmount);
     const peopleOk = pdfPeople === '' || pdfPeople === null || pdfPeople === undefined ? true : Number(excelPeople||0) === Number(pdfPeople||0);
     if(amountOk && peopleOk) return '일치';
     const parts=[]; if(!amountOk) parts.push('금액 차이'); if(!peopleOk) parts.push('인원 차이'); return parts.join(', ');
@@ -425,6 +469,14 @@ function buildPrecheck(report){
     rows.push({구분:'수당', 항목:'교원수당', 엑셀금액:teacherAnalysis.totalExcel, 엑셀인원:'', PDF금액:teacherAllowanceTotal, PDF인원:'', 확인:teacherAnalysis.verdict});
     rows.push({구분:'수당', 항목:'직원수당', 엑셀금액:staffAnalysis.totalExcel, 엑셀인원:'', PDF금액:staffAllowanceTotal, PDF인원:'', 확인:staffAnalysis.verdict});
 
+    // 금액 차이가 나는 경우, 같은 차액이 다른 목에 편성되어 있는지 네 항목 모두에서 확인합니다.
+    addOffMokDiffIssues(issues, calcs, [
+      {category:'교원급여', expectedMok:'교원급여', excelAmount:teacherBase, pdfAmount:teacherPayTotal},
+      {category:'교원수당', expectedMok:'교원수당', excelAmount:teacherAnalysis.totalExcel, pdfAmount:teacherAllowanceTotal},
+      {category:'직원급여', expectedMok:'직원급여', excelAmount:staffBase, pdfAmount:staffPayTotal},
+      {category:'직원수당', expectedMok:'직원수당', excelAmount:staffAnalysis.totalExcel, pdfAmount:staffAllowanceTotal}
+    ]);
+
     // 동적 미편성 지적: 개별 PDF 항목에도 없고, 통합수당 총액으로도 설명되지 않는 수당만 지적합니다.
     addMissingAllowanceIssues(issues, teacherAnalysis, staffAnalysis);
   }
@@ -435,6 +487,7 @@ function buildPrecheck(report){
   // PDF 표의 '목' 기준으로 정상 편성 여부를 봅니다. 관/항은 판정에 사용하지 않습니다.
   const allowedMokRe = /(교원급여|교원수당|직원급여|직원수당|그밖의인건비|그밖의인건비|교원인건비|직원인건비)/;
   const wrongMap = new Map();
+  for(const issue of issues){ wrongMap.set(issue.지적내용, true); }
   for(const x of calcs){
     if(!x || !x.항목 || !x.PDF금액) continue;
     if(LEGAL_RE.test(x.항목)) continue;
@@ -443,10 +496,11 @@ function buildPrecheck(report){
     if(!isLabor) continue;
     const mok = x.목 || x.상위항목 || '';
     if(!mok || allowedMokRe.test(mok)) continue;
+    const textIssue = `${x.항목} ${shortWon(x.PDF금액)}을 직원·교원 인건비 목이 아닌 ${mok} 목의 산출내역에 편성`;
     const key = `${x.항목}|${mok}|${x.PDF금액}`;
-    if(wrongMap.has(key)) continue;
-    wrongMap.set(key, x);
-    addIssue(`${x.항목} ${Math.round(x.PDF금액/10000).toLocaleString('ko-KR')}만원을 직원·교원 인건비 목이 아닌 ${mok} 목의 산출내역에 편성`, `PDF ${x.페이지}쪽: ${x.산출기초}`);
+    if(wrongMap.has(key) || wrongMap.has(textIssue)) continue;
+    wrongMap.set(key, x); wrongMap.set(textIssue, true);
+    addIssue(textIssue, `PDF ${x.페이지}쪽: ${x.산출기초}`);
   }
 
   const excelRetire = (report.excel?.retirement || []).some(r=>r.hasRetirementAmount);
@@ -471,10 +525,14 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupTotal){
   const totalExcel = relevant.reduce((s,a)=>s+a[amountField],0);
   const missingSum = missing.reduce((s,a)=>s+a[amountField],0);
   const directSum = direct.reduce((s,a)=>s+a[amountField],0);
-  const coveredByGroup = Number(groupTotal||0)>0 && (Number(groupTotal||0) === totalExcel || Number(groupTotal||0) === missingSum || Number(groupTotal||0) === (totalExcel-directSum));
+  const explainedByMissing = Number(groupTotal||0)>0 && closeMoney(groupTotal, missingSum);
+  const explainedByTotal = Number(groupTotal||0)>0 && closeMoney(groupTotal, totalExcel);
+  const explainedByRemainder = Number(groupTotal||0)>0 && closeMoney(groupTotal, totalExcel-directSum);
+  const coveredByGroup = explainedByMissing || explainedByTotal || explainedByRemainder;
   let verdict = '';
-  if(totalExcel && groupTotal === totalExcel) verdict = '총액 일치';
-  else if(missingSum && groupTotal === missingSum) verdict = `통합편성(${missing.map(a=>`${a.항목} ${fmt(a[amountField])}`).join(' + ')} = ${fmt(missingSum)})`;
+  const integratedList = missing.map(a=>`${a.항목}(${fmt(a[amountField])})`).join(' + ');
+  if(totalExcel && closeMoney(groupTotal, totalExcel)) verdict = `총액 일치 또는 통합편성(${fmt(totalExcel)} ≒ ${kind}수당 ${fmt(groupTotal)})`;
+  else if(missingSum && closeMoney(groupTotal, missingSum)) verdict = `${integratedList} = ${kind}수당(${fmt(groupTotal)})으로 통합편성`;
   else if(missingSum && !groupTotal) verdict = `추가확인필요: PDF ${kind}수당 총액행 없음, 미개별표시 수당 ${fmt(missingSum)}`;
   else if(missingSum) verdict = `추가확인필요: 미개별표시 수당 합계 ${fmt(missingSum)}, PDF ${kind}수당 ${fmt(groupTotal)}`;
   else verdict = '개별 또는 총액 확인';
