@@ -237,29 +237,33 @@ async function normalizeXlsxForSheetJS(buf){
 }
 
 function sheetScore(name){
-  let score = 0; const n = norm(name);
-  if(/교직원보수일람표/.test(n)) score += 100;
-  if(/년|연/.test(n)) score += 30;
-  if(/월/.test(n)) score -= 20;
-  if(SALARY_SHEET_RE.test(name)) score += 40;
-  if(/월급여|비월정|간이세액|세출|세입/.test(name)) score -= 100;
-  return score;
+  let score = 0;
+  const n = norm(name);
+  const isSalary = /(교직원.*보수|보수.*일람|보수|급여|봉급|인건비|교직원)/.test(name);
+  if(!isSalary) return 0;
+  if(/교직원보수일람표/.test(n)) score += 120;
+  if(/보수/.test(n)) score += 50;
+  if(/급여|봉급|인건비/.test(n)) score += 25;
+  if(/\(년\)|년간|연간|연/.test(n)) score += 35;
+  if(/\(월\)|월간|월급여|월/.test(n)) score -= 25;
+  if(/비월정|간이세액|세출|세입|퇴직|보험|명시이월|사고이월/.test(name)) score -= 120;
+  return Math.max(0, score);
 }
 function parseSalarySheet(sheetName, aoa){
-  const preview = aoa.slice(0,40).map((r,i)=>({행:i+1, 내용:r.map(text).filter(Boolean).join(' | ').slice(0,250)})).filter(x=>x.내용);
+  const preview = aoa.slice(0,60).map((r,i)=>({행:i+1, 내용:r.map(text).filter(Boolean).join(' | ').slice(0,300)})).filter(x=>x.내용);
   if(!aoa.length) return {ok:false, sheetName, message:'빈 시트', preview};
-  const maxRows = Math.min(80, aoa.length), maxCols = Math.max(...aoa.slice(0,maxRows).map(r=>r.length),0);
-  const colText = Array.from({length:maxCols},(_,c)=>aoa.slice(0,maxRows).map(r=>r[c]).map(text).join(' '));
-  const jobCol = findCol(colText, [/^직명$/, /직명/]);
-  const nameCol = findCol(colText, [/^성명$/, /성명/]);
-  const baseCol = findCol(colText, [/본봉/, /기본급/]);
-  const totalCol = findCol(colText, [/지급액계/, /지급액.*계/, /월지급액계/, /합계/]);
-  if(jobCol < 0 || baseCol < 0 || totalCol < 0) return {ok:false, sheetName, message:`헤더 미발견: 직명=${jobCol+1}, 본봉=${baseCol+1}, 지급액계=${totalCol+1}`, preview};
-  const headerRow = findHeaderRow(aoa, [jobCol, baseCol, totalCol]);
+  const maxRows = Math.min(100, aoa.length), maxCols = Math.max(...aoa.slice(0,maxRows).map(r=>r.length),0);
+  const detected = detectSalaryHeader(aoa, maxRows, maxCols);
+  if(!detected.ok){
+    return {ok:false, sheetName, message:detected.message, preview};
+  }
+  const {headerRow, jobCol, nameCol, baseCol, totalCol} = detected;
   const allowanceCols = [];
   for(let c=baseCol+1; c<totalCol; c++){
-    const h = headerNameForCol(aoa, c, headerRow) || cleanHeader(colText[c]);
-    if(h && !/성명|호봉|직명|일련|본봉|기본급|지급액계|합계|소계/.test(h)) allowanceCols.push({ col:c, name:h || `열${c+1}` });
+    const h = headerNameForCol(aoa, c, headerRow) || cleanHeader(columnText(aoa, c, maxRows));
+    if(h && !/성\s*명|호봉|직명|일련|번호|주민등록|본봉|기본급|지급액계|지급액.*계|합계|소계|소득세|주민세|본인부담|공제액계|실수령액|사학연금|국민연금|사회보험/.test(h)){
+      allowanceCols.push({ col:c, name:h || `열${c+1}` });
+    }
   }
   const teacherEnd = findRow(aoa, headerRow+1, /소계\s*\(?교원\)?|소계교원/);
   const staffEnd = findRow(aoa, (teacherEnd>=0?teacherEnd+1:headerRow+1), /소계\s*\(?(직원|일반직)\)?|소계직원|소계일반직/);
@@ -267,26 +271,93 @@ function parseSalarySheet(sheetName, aoa){
   const staffRows = rowsInRange(aoa, teacherEnd>=0?teacherEnd+1:headerRow+1, staffEnd, {jobCol,nameCol,baseCol,totalCol,allowanceCols});
   const teacherSubtotal = teacherEnd>=0 ? parseDataRow(aoa[teacherEnd], {jobCol,nameCol,baseCol,totalCol,allowanceCols}) : null;
   const staffSubtotal = staffEnd>=0 ? parseDataRow(aoa[staffEnd], {jobCol,nameCol,baseCol,totalCol,allowanceCols}) : null;
+  if(!teacherRows.length && !staffRows.length && !teacherSubtotal && !staffSubtotal){
+    return {ok:false, sheetName, message:'헤더는 찾았으나 교원/직원 데이터 범위를 읽지 못했습니다.', preview};
+  }
   const summary = summarizeSalary(teacherRows, staffRows, teacherSubtotal, staffSubtotal, allowanceCols);
-  return {ok:true, sheetName, header:{headerRow:headerRow+1, jobCol:jobCol+1, nameCol:nameCol+1, baseCol:baseCol+1, totalCol:totalCol+1, allowanceCols:allowanceCols.map(x=>({열:x.col+1, 이름:x.name}))}, ranges:{teacherStart:headerRow+2, teacherEnd:teacherEnd>=0?teacherEnd: null, staffStart:teacherEnd>=0?teacherEnd+2:headerRow+2, staffEnd:staffEnd>=0?staffEnd:null}, summary, teacherRows, staffRows, teacherSubtotal, staffSubtotal, preview};
+  return {ok:true, sheetName, header:{headerRow:headerRow+1, jobCol:jobCol+1, nameCol:nameCol+1, baseCol:baseCol+1, totalCol:totalCol+1, allowanceCols:allowanceCols.map(x=>({열:x.col+1, 이름:x.name}))}, ranges:{teacherStart:headerRow+2, teacherEnd:teacherEnd>=0?teacherEnd+1: null, staffStart:teacherEnd>=0?teacherEnd+2:headerRow+2, staffEnd:staffEnd>=0?staffEnd+1:null}, summary, teacherRows, staffRows, teacherSubtotal, staffSubtotal, preview};
 }
-function findCol(colText, patterns){
+function detectSalaryHeader(aoa, maxRows, maxCols){
+  let best = null;
+  for(let r=0; r<maxRows; r++){
+    const rowWindow = [];
+    for(let c=0; c<maxCols; c++){
+      rowWindow[c] = [aoa[r-1]?.[c], aoa[r]?.[c], aoa[r+1]?.[c]].map(text).filter(Boolean).join(' ');
+    }
+    const jobCol = findColInTexts(rowWindow, [/^직명$/, /직\s*명/]);
+    const nameCol = findColInTexts(rowWindow, [/^성\s*명$/, /성\s*명/]);
+    const baseCol = findColInTexts(rowWindow, [/본봉/, /기본급/]);
+    const totalCol = findColInTexts(rowWindow, [/지급액계/, /지급액\s*계/, /월지급액계/]);
+    let score = 0;
+    if(jobCol>=0) score+=4; if(baseCol>=0) score+=4; if(totalCol>=0) score+=4; if(nameCol>=0) score+=1;
+    if(baseCol>=0 && totalCol>baseCol) score+=3;
+    const all = rowWindow.join(' ');
+    if(/교직원|보수|일람/.test(all)) score-=1;
+    if(score > (best?.score ?? -1)) best = {score, headerRow:r, jobCol, nameCol, baseCol, totalCol};
+  }
+  // 열 전체 검색 보조: 병합/다중행/한컴 XLSX에서 헤더가 서로 다른 행에 흩어져 있을 때 사용
+  const colText = Array.from({length:maxCols},(_,c)=>columnText(aoa,c,maxRows));
+  const colDetected = {
+    headerRow: findHeaderRow(aoa, []),
+    jobCol: findColInTexts(colText, [/^직명$/, /직\s*명/]),
+    nameCol: findColInTexts(colText, [/^성\s*명$/, /성\s*명/]),
+    baseCol: findColInTexts(colText, [/본봉/, /기본급/]),
+    totalCol: findColInTexts(colText, [/지급액계/, /지급액\s*계/, /월지급액계/]),
+    score: 0
+  };
+  if(colDetected.jobCol>=0) colDetected.score+=3;
+  if(colDetected.baseCol>=0) colDetected.score+=3;
+  if(colDetected.totalCol>=0) colDetected.score+=3;
+  if(colDetected.baseCol>=0 && colDetected.totalCol>colDetected.baseCol) colDetected.score+=2;
+  const picked = (best && best.score >= colDetected.score) ? best : colDetected;
+  if(picked.jobCol < 0 || picked.baseCol < 0 || picked.totalCol < 0 || picked.totalCol <= picked.baseCol){
+    return {ok:false, message:`헤더 미발견: 직명=${picked.jobCol+1}, 본봉=${picked.baseCol+1}, 지급액계=${picked.totalCol+1}`};
+  }
+  if(picked.headerRow == null || picked.headerRow < 0){
+    picked.headerRow = findHeaderRow(aoa, [picked.jobCol, picked.baseCol, picked.totalCol]);
+  }
+  return {ok:true, ...picked};
+}
+function columnText(aoa, c, maxRows=80){
+  return aoa.slice(0,maxRows).map(r=>r?.[c]).map(text).filter(Boolean).join(' ');
+}
+function findColInTexts(texts, patterns){
   let best=-1, bestScore=-1;
-  colText.forEach((t,i)=>{ const n=norm(t); patterns.forEach((re,idx)=>{ if(re.test(n) || re.test(t)){ const sc=100-idx; if(sc>bestScore){best=i; bestScore=sc;} } }); });
+  texts.forEach((t,i)=>{
+    const n=norm(t);
+    patterns.forEach((re,idx)=>{
+      if(re.test(n) || re.test(t)){
+        const sc=100-idx;
+        if(sc>bestScore){best=i; bestScore=sc;}
+      }
+    });
+  });
   return best;
 }
+function findCol(colText, patterns){ return findColInTexts(colText, patterns); }
 function findHeaderRow(aoa, cols){
   let best=0, score=-1;
-  aoa.slice(0,80).forEach((r,i)=>{ let s=0; cols.forEach(c=>{ if(text(r[c])) s++; }); const all=r.map(text).join(' '); if(/직명/.test(all))s+=2; if(/본봉|기본급/.test(all))s+=2; if(/지급액계/.test(all))s+=2; if(s>score){score=s;best=i;} }); return best;
+  aoa.slice(0,100).forEach((r,i)=>{
+    let s=0;
+    if(cols && cols.length) cols.forEach(c=>{ if(text(r?.[c])) s++; });
+    const all=r.map(text).join(' ');
+    if(/직\s*명/.test(all))s+=3;
+    if(/본봉|기본급/.test(all))s+=3;
+    if(/지급액계|지급액\s*계/.test(all))s+=3;
+    if(/소득세|실수령액|공제액/.test(all))s+=1;
+    if(s>score){score=s;best=i;}
+  });
+  return best;
 }
 function findRow(aoa, start, re){ for(let r=Math.max(0,start); r<aoa.length; r++){ if(re.test(aoa[r].map(text).join(' '))) return r; } return -1; }
 function rowsInRange(aoa, start, end, cfg){
   const last = end>=0 ? end : aoa.length;
   const rows=[];
   for(let r=Math.max(0,start); r<last; r++){
-    const row = parseDataRow(aoa[r], cfg); if(row && (row.직명 || row.성명 || row.본봉 || row.지급액계)) rows.push({...row, 행:r+1});
+    const row = parseDataRow(aoa[r], cfg);
+    if(row && (row.직명 || row.성명 || row.본봉 || row.지급액계 || Object.values(row.수당||{}).some(Boolean))) rows.push({...row, 행:r+1});
   }
-  return rows.filter(r=> !/소계|합계|계\s*$/.test(`${r.직명} ${r.성명}`));
+  return rows.filter(r=> !/소계|합계|계\s*$/.test(`${r.직명} ${r.성명}`) && (r.직명 || r.성명));
 }
 function parseDataRow(row, cfg){
   if(!row) return null;
@@ -296,20 +367,21 @@ function parseDataRow(row, cfg){
   return out;
 }
 function summarizeSalary(teacherRows, staffRows, teacherSubtotal, staffSubtotal, allowanceCols){
-  const sumRows = (rows) => ({인원:rows.filter(r=>r.본봉 || r.지급액계 || Object.values(r.수당).some(Boolean)).length, 본봉:rows.reduce((s,r)=>s+r.본봉,0), 지급액계:rows.reduce((s,r)=>s+r.지급액계,0)});
+  const rowHasMoney = r => (r.본봉 || r.지급액계 || Object.values(r.수당||{}).some(Boolean));
+  const sumRows = (rows) => ({인원:rows.filter(rowHasMoney).length, 본봉:rows.reduce((s,r)=>s+r.본봉,0), 지급액계:rows.reduce((s,r)=>s+r.지급액계,0)});
   const t = sumRows(teacherRows), s = sumRows(staffRows);
   const allowances = allowanceCols.map(a=>({항목:a.name, 교원금액:teacherRows.reduce((sum,r)=>sum+(r.수당[a.name]||0),0), 직원금액:staffRows.reduce((sum,r)=>sum+(r.수당[a.name]||0),0), 교원인원:teacherRows.filter(r=>(r.수당[a.name]||0)>0).length, 직원인원:staffRows.filter(r=>(r.수당[a.name]||0)>0).length})).filter(x=>x.교원금액||x.직원금액);
   return {교원:{...t, 소계본봉:teacherSubtotal?.본봉||0, 소계지급액계:teacherSubtotal?.지급액계||0}, 직원:{...s, 소계본봉:staffSubtotal?.본봉||0, 소계지급액계:staffSubtotal?.지급액계||0}, 수당:allowances};
 }
-function cleanHeader(s){ return text(s).replace(/\([A-Z]\)/g,'').replace(/\s+/g,' ').trim().slice(0,40); }
+function cleanHeader(s){ return text(s).replace(/\([A-Z][^)]*\)/g,'').replace(/\s+/g,' ').trim().slice(0,40); }
 function headerNameForCol(aoa, col, headerRow){
-  const start = Math.max(0, headerRow - 6);
-  const end = Math.min(aoa.length - 1, headerRow + 2);
+  const start = Math.max(0, headerRow - 2);
+  const end = Math.min(aoa.length - 1, headerRow + 1);
   const vals = [];
   for(let r=start; r<=end; r++){
     const v = text(aoa[r]?.[col]);
     if(!v) continue;
-    if(toNum(v) || /소계|합계|원장|교사|직원|성명|직명|호봉|순번|번호|구분/.test(v)) continue;
+    if(toNum(v) || /소계|합계|원장|교사|직원|성명|직명|호봉|순번|번호|구분|주민등록|소득세|주민세|공제|실수령/.test(v)) continue;
     vals.push(v);
   }
   return cleanHeader([...new Set(vals)].join(' '));
