@@ -928,7 +928,11 @@ function findOffMokMatches(calcs, expectedMok, diff, category){
     if(!mok || mok.includes(target)) return false;
     if(!closeMoney(Math.abs(x.PDF금액), absDiff)) return false;
     const label = norm((x.항목 || '') + ' ' + (x.산출기초 || ''));
-    if(isPay) return /(급여|인건비|보수)/.test(label);
+    if(isPay){
+      // 직원급여 차액이 통학차량이용비/통학차량임차료 등에 숨어 있는 경우도 잡습니다.
+      if(/직원급여/.test(categoryNorm) && /(통학차량|차량|임차료|운행|기사)/.test(label + mok)) return true;
+      return /(급여|인건비|보수)/.test(label);
+    }
     if(isAllowance) return /(수당|상여|휴가비|식대|정액급식|자가운전|직급|직책|연구|관리업무)/.test(label);
     return true;
   });
@@ -999,7 +1003,11 @@ function detailVerdict(label, excelAmount, pdfAmount, excelPeople, pdfPeople, of
     const diff=ea-pa;
     if(offMatches && offMatches.length){
       const m=offMatches[0];
-      parts.push(`금액 차이(${label} ${shortWon(Math.abs(diff))} 차이 → ${m.목 || m.상위항목} 목에 ${cleanItemName(m.항목)} ${fmt(m.PDF금액)} 편성)`);
+      const itemName = cleanItemName(m.항목);
+      const offText = (/직원급여/.test(label) && /통학차량|차량임차|임차료/.test(norm((m.목||'') + itemName)))
+        ? `통학차량 기사 급여 ${fmt(m.PDF금액)}을 ${itemName}로 편성`
+        : `${m.목 || m.상위항목} 목에 ${itemName} ${fmt(m.PDF금액)} 편성`;
+      parts.push(`금액 차이(${label} ${shortWon(Math.abs(diff))} 차이 → ${offText})`);
     }else{
       parts.push(`금액 차이(엑셀 ${fmt(ea)} / PDF ${fmt(pa)} / 차이 ${fmt(Math.abs(diff))})`);
     }
@@ -1017,18 +1025,46 @@ function allowanceGroupCandidates(groupRow, kind){
   if(groupRow.기타금액) out.push({label:`${kind}수당`, amount:Number(groupRow.기타금액||0)});
   return out.filter((x,i,a)=>x.amount && a.findIndex(y=>y.amount===x.amount)===i);
 }
+function allowanceKeys(s){
+  const raw = String(s || '');
+  const compact = norm(raw);
+  const keys = new Set();
+  // 복합 항목: "연구수당/교통보조금"처럼 엑셀 한 열에 두 성격이 함께 있는 경우
+  // PDF에서는 각각 연구수당, 교통보조비로 나뉘어 편성될 수 있으므로 구성요소를 모두 찾습니다.
+  raw.split(/[\/,+·ㆍ&]+|및|와|과/).map(x=>x.trim()).filter(Boolean).forEach(part=>{
+    const k = allowanceKey(part);
+    if(k) keys.add(k);
+  });
+  const k = allowanceKey(raw);
+  if(k) keys.add(k);
+  // 문자열 안에 대표 수당명이 같이 들어 있으면 보조 키를 추가합니다.
+  if(/연구/.test(compact)) keys.add('연구');
+  if(/교통보조|자가운전|운전수당|차량유지/.test(compact)) keys.add('자가운전');
+  if(/연장근로|시간외|연장수당/.test(compact)) keys.add('시간외');
+  if(/급식|식대|정액급식/.test(compact)) keys.add('정액급식');
+  if(/직급보조|직급수당/.test(compact)) keys.add('직급');
+  if(/직책/.test(compact)) keys.add('직책급');
+  if(/근속/.test(compact)) keys.add('근속');
+  if(/상여/.test(compact)) keys.add('상여');
+  return [...keys].filter(Boolean);
+}
 function findAllowancePdfMatches(kind, allowanceName, amount, pdfItems){
-  const key = allowanceKey(allowanceName);
-  return pdfItems.filter(x=>{
-    if(x.구분 !== '산출기초') return false;
-    if(!allowancePdfHit(kind, key, amount, x)) return false;
-    // 같은 명칭이어도 PDF 추출이 엇갈린 경우를 막기 위해 금액도 함께 확인합니다.
-    // 다만 PDF가 같은 항목을 재원별로 나눈 경우에는 합산 단계에서 처리되므로
-    // 개별 산출기초 금액이 엑셀금액 이하인 경우까지 허용합니다.
+  const keys = allowanceKeys(allowanceName);
+  const seen = new Set();
+  const matches = [];
+  for(const x of pdfItems){
+    if(x.구분 !== '산출기초') continue;
+    if(!keys.some(key => allowancePdfHit(kind, key, amount, x))) continue;
     const pdfAmt = Number(x.PDF금액 || 0);
     const excelAmt = Number(amount || 0);
-    return !excelAmt || closeMoney(pdfAmt, excelAmt) || pdfAmt <= excelAmt;
-  });
+    // 같은 수당이 [방]/[급]/재원별 등으로 나뉜 경우에는 여러 블록을 합산해야 하므로
+    // 개별 블록은 엑셀 금액 이하이면 허용합니다.
+    if(excelAmt && !(closeMoney(pdfAmt, excelAmt) || pdfAmt <= excelAmt + 1000)) continue;
+    const id = `${x.페이지}|${x.행}|${x.목}|${x.항목}|${x.PDF금액}`;
+    if(seen.has(id)) continue;
+    seen.add(id); matches.push(x);
+  }
+  return matches;
 }
 function integratedText(kind, list, amountField, groupLabel, groupAmount){
   const expr = list.map(a=>`${a.항목}(${fmt(a[amountField])})`).join(' + ');
@@ -1075,7 +1111,7 @@ function addPayBreakdownRows(rows, kind, salaryObj, payCalcs, allCalcs){
 
 function isRetirementName(s){
   const n = norm(s || '');
-  return /퇴직/.test(n) && /(적립|퇴직금|충당|급여)/.test(n);
+  return /퇴직/.test(n) && /(적립|퇴직금|충당|급여|퇴직)/.test(n);
 }
 function getExcelRetirementSummary(retirementSheets){
   const sheets = retirementSheets || [];
@@ -1213,7 +1249,12 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupRowOrTotal){
     const pdfPeople = matches.reduce((s,x)=>s+Number(x.인원||0),0);
     if(matches.length){
       direct.push(a);
-      details.push({항목:`${kind} ${a.항목}`, 엑셀금액:amount, 엑셀인원:a[peopleField]||'', PDF금액:pdfAmount, PDF인원:pdfPeople||'', 검토결과:`개별편성 확인(${[...new Set(matches.map(m=>cleanItemName(m.항목)).filter(Boolean))].join(', ')})`});
+      const names = [...new Set(matches.map(m=>cleanItemName(m.항목)).filter(Boolean))].join(', ');
+      const diff = Math.abs(Math.round(amount - pdfAmount));
+      const result = closeMoney(amount, pdfAmount)
+        ? `개별편성확인(금액일치: ${names})`
+        : `개별편성확인(${fmt(diff)} 차이: ${names})`;
+      details.push({항목:`${kind} ${a.항목}`, 엑셀금액:amount, 엑셀인원:a[peopleField]||'', PDF금액:pdfAmount, PDF인원:pdfPeople||'', 검토결과:result});
     }else{
       missing.push(a);
     }
@@ -1311,23 +1352,23 @@ function allowanceVerdict(kind, allowanceRows, pdfItems, groupTotal){
 function allowanceKey(s){
   let k = norm(s);
   if(!k) return '';
-  // [방], [급], [운영]처럼 기관 내부 구분 태그는 같은 수당명으로 봅니다.
-  k = k.replace(/^(?:\[[^\]]+\])+/g, '');
-  // 소속/직종 접두어는 같은 항목 매칭에서 제외합니다.
+  // norm()이 대괄호를 제거하므로 [방]근속수당은 "방근속수당"처럼 됩니다.
+  // 기관 내부 접두어는 같은 수당명으로 보되, 방학휴가비 같은 실제 단어는 보존합니다.
   k = k.replace(/^(교원|직원|교사|사무직원|조리직원|보조교사)/,'');
-  // 접두어 제거 후 다시 [방] 같은 태그가 나오는 경우도 제거합니다. 예: 교원[방]근속수당
-  k = k.replace(/^(?:\[[^\]]+\])+/g, '');
+  k = k.replace(/^(방|급|운영|수|교)(?=(근속|급식|기본급|상여|연장|연구|직책|직급|운전|기타|식대|정액급식))/,'');
 
   // 기관마다 다른 명칭을 같은 수당으로 봅니다.
-  if(/^(식대|급식비|정액급식비|정액급식|급식수당|급식보조비)$/.test(k) || /정액급식/.test(k)) return '정액급식';
+  if(/식대|급식비|정액급식|급식수당|급식보조/.test(k)) return '정액급식';
+  if(/연장근로|시간외|연장수당/.test(k)) return '시간외';
+  if(/연구활동|연구수당|연구비|연구/.test(k)) return '연구';
+  if(/교통보조|자가운전|자가차량|차량유지|운전수당/.test(k)) return '자가운전';
+  if(/직급보조|직급수당/.test(k)) return '직급';
+  if(/직책급|직책/.test(k)) return '직책급';
+  if(/근속/.test(k)) return '근속';
   if(/성과상여/.test(k)) return '성과상여';
   if(/명절휴가/.test(k)) return '명절휴가';
   if(/스승의날/.test(k)) return '스승의날상여';
   if(/방학휴가/.test(k)) return '방학휴가';
-  if(/자가운전|자가차량|차량유지|운전수당|교통보조/.test(k)) return '자가운전';
-  if(/직책급|직책/.test(k)) return '직책급';
-  // 해아뜰처럼 PDF와 엑셀 모두 단순히 '상여금'으로 적힌 경우를 처리합니다.
-  // 단, 명절/스승의날/방학/성과상여는 위에서 먼저 분리했으므로 여기서는 일반 상여금만 묶습니다.
   if(/^상여금?$/.test(k) || k === '상여') return '상여';
 
   const stripped = k.replace(/수당|보조금|지원비|지원금|상여금|휴가비|급식비|식대|비/g,'');
