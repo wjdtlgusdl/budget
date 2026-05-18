@@ -921,7 +921,7 @@ function findOffMokMatches(calcs, expectedMok, diff, category){
   const categoryNorm = norm(category || expectedMok);
   const isPay = /급여/.test(category);
   const isAllowance = /수당/.test(category);
-  return calcs.filter(x=>{
+  const direct = calcs.filter(x=>{
     if(!x || !x.PDF금액) return false;
     if(LEGAL_RE.test(x.항목 || '')) return false;
     const mok = norm(x.목 || x.상위항목 || '');
@@ -936,6 +936,36 @@ function findOffMokMatches(calcs, expectedMok, diff, category){
     if(isAllowance) return /(수당|상여|휴가비|식대|정액급식|자가운전|직급|직책|연구|관리업무)/.test(label);
     return true;
   });
+  if(direct.length) return direct;
+
+  // v49: 차액이 한 산출항목이 아니라 같은 목 안의 여러 산출항목 합계와 일치하는 경우를 잡습니다.
+  // 예: 직원급여 차액 69,300,000원 = 통학차량이용비 목의 통학차량임차료(수익자) 2,004,000원 + 통학차량임차료 67,296,000원
+  if(/직원급여|교원급여/.test(categoryNorm)){
+    const groups = new Map();
+    for(const x of calcs){
+      if(!x || !x.PDF금액 || LEGAL_RE.test(x.항목 || '')) continue;
+      const mokText = String(x.목 || x.상위항목 || '');
+      const mok = norm(mokText);
+      if(!mok || mok.includes(target)) continue;
+      const label = norm((x.항목 || '') + ' ' + (x.산출기초 || '') + ' ' + mokText);
+      if(!/(통학차량|차량|임차료|운행|기사)/.test(label)) continue;
+      if(!groups.has(mok)) groups.set(mok, {목:mokText, amount:0, items:[]});
+      const g = groups.get(mok);
+      g.amount += Number(x.PDF금액 || 0);
+      g.items.push(x);
+    }
+    for(const g of groups.values()){
+      if(closeMoney(g.amount, absDiff)){
+        const names = [...new Set(g.items.map(x=>cleanItemName(x.항목)).filter(Boolean))];
+        const mainName = names.find(n=>/통학|차량|임차/.test(norm(n))) || names[0] || '통학차량임차료';
+        return [{
+          페이지:g.items[0]?.페이지 || '', 행:g.items[0]?.행 || '', 목:g.목,
+          항목:mainName, PDF금액:g.amount, 산출기초:g.items.map(x=>x.산출기초).join(' / '), 구분:'산출기초합계'
+        }];
+      }
+    }
+  }
+  return [];
 }
 function addOffMokDiffIssues(issues, calcs, checks){
   const seen = new Set(issues.map(i=>i.지적내용 + '|' + i.근거));
@@ -1300,8 +1330,9 @@ function allowancePdfHit(kind, key, amount, x){
   if(LEGAL_RE.test(x.항목||'')) return false;
   const mok = norm(x.목 || x.상위항목 || '');
   const item = norm(x.항목 || '');
-  const calc = norm(x.산출기초 || '');
+  const labelText = `${x.항목 || ''} ${x.산출기초 || ''}`;
   const k2 = allowanceKey(x.항목 || '');
+  const labelKeys = allowanceKeys(labelText);
   const allowanceMok = kind === '교원' ? '교원수당' : '직원수당';
 
   // 수당 개별편성은 원칙적으로 해당 수당 목 안에서만 인정합니다.
@@ -1312,13 +1343,15 @@ function allowancePdfHit(kind, key, amount, x){
     : /^직원|^사무직원|^조리직원|^보조교사|^차량기사|^차량보조|^환경미화|^영양사/.test(item);
 
   // 식대 ↔ 정액급식비 동의어는 교원/직원 수당 목 또는 명확한 교원/직원 정액급식 항목에서만 적용합니다.
-  const isMealKey = key === '정액급식' || k2 === '정액급식';
+  const isMealKey = key === '정액급식' || k2 === '정액급식' || labelKeys.includes('정액급식');
   if(isMealKey){
     const scopedMeal = inRightMok || item.includes(kind + '정액급식') || item.includes(kind + '식대');
     if(!scopedMeal) return false;
   }
 
-  const keyMatched = !!(k2 && (k2 === key || k2.includes(key) || key.includes(k2)));
+  // v49: PDF 산출내역이 여러 줄로 쪼개지는 파일에서는 x.항목만 보면 '직', '급보조비'처럼 일부가 빠질 수 있습니다.
+  // 산출기초 블록 전체(labelText)에서 동의어 키를 다시 추출해 같은 수당 여부를 판단합니다.
+  const keyMatched = labelKeys.some(k => k === key || k.includes(key) || key.includes(k));
   if(!keyMatched) return false;
 
   // 기타수당처럼 일반적인 명칭은 해당 수당 목 안에 있을 때만 인정합니다.
@@ -1361,7 +1394,7 @@ function allowanceKey(s){
   if(/식대|급식비|정액급식|급식수당|급식보조/.test(k)) return '정액급식';
   if(/연장근로|시간외|연장수당/.test(k)) return '시간외';
   if(/연구활동|연구수당|연구비|연구/.test(k)) return '연구';
-  if(/교통보조|자가운전|자가차량|차량유지|운전수당/.test(k)) return '자가운전';
+  if(/교통보조|교통비|자가운전|자가차량|차량유지|운전수당/.test(k)) return '자가운전';
   if(/직급보조|직급수당/.test(k)) return '직급';
   if(/직책급|직책/.test(k)) return '직책급';
   if(/근속/.test(k)) return '근속';
