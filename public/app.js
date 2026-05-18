@@ -2544,46 +2544,59 @@ function detailVerdict(label, excelAmount, pdfAmount, excelPeople, pdfPeople, of
   return parts.length ? parts.join(' / ') : '일치';
 }
 
-/* ===== v62.1 safe hotfix =====
-   - 상여금이 통합편성 fallback으로 표시되는 경우, 같은 수당목의 일반 상여금 단독 금액으로 보아 개별편성 표시로 승격
-   - 지적사항의 오편성 자동 탐색은 급여 차액에만 적용하여 행사비 등 우연 조합 오탐 방지
+/* ===== v62 해아뜰 상여금 개별편성 최종 보정 =====
+   v61에서도 해아뜰처럼 산출내역 상여금 블록이 통합편성 후보로 먼저 떨어지는 경우가 있어,
+   최종 수당 분석 결과에서 해당 목 내부의 일반 상여금 산출기초를 다시 찾아 개별편성으로 승격합니다.
 */
-function extractFirstMoneyFromText_v621(text){
-  const m = String(text || '').match(/통합편성금액\(([0-9,]+)원\)/) || String(text || '').match(/수당\(([0-9,]+)원\)/);
-  return m ? Number(m[1].replace(/,/g,'')) : 0;
-}
+const __analyzeAllowances_base_v62_bonus = analyzeAllowances;
+analyzeAllowances = function(kind, allowanceRows, pdfItems, groupRowOrTotal){
+  const res = __analyzeAllowances_base_v62_bonus(kind, allowanceRows, pdfItems, groupRowOrTotal);
+  try{
+    const amountField = kind === '교원' ? '교원금액' : '직원금액';
+    const peopleField = kind === '교원' ? '교원인원' : '직원인원';
+    const relevantBonus = (allowanceRows || []).filter(a => Number(a?.[amountField] || 0) > 0 && allowanceKey(a?.항목 || '') === '상여');
+    if(!relevantBonus.length) return res;
 
-const __analyzeAllowances_v621 = analyzeAllowances;
-function analyzeAllowances(kind, allowanceRows, pdfItems, groupRow){
-  const res = __analyzeAllowances_v621(kind, allowanceRows, pdfItems, groupRow);
-  for(const d of (res.details || [])){
-    if(!/상여금/.test(d.항목 || '')) continue;
-    if(!/통합편성/.test(d.검토결과 || '')) continue;
-    const excelAmt = Number(d.엑셀금액 || 0);
-    const pdfAmt = extractFirstMoneyFromText_v621(d.검토결과) || Number(d.PDF금액 || 0);
-    if(pdfAmt && closeMoney(excelAmt, pdfAmt)){
-      d.PDF금액 = pdfAmt;
-      d.검토결과 = `개별편성확인(금액일치: 상여금)`;
+    for(const a of relevantBonus){
+      const excelAmt = Number(a[amountField] || 0);
+      const alreadyDirect = (res.details || []).some(d => norm(d.항목 || '') === norm(`${kind} ${a.항목}`) && Number(d.PDF금액 || 0) > 0 && /^개별편성/.test(d.검토결과 || ''));
+      if(alreadyDirect) continue;
+
+      const candidates = (pdfItems || []).filter(x =>
+        x && x.구분 === '산출기초' &&
+        isRightAllowanceMok_v59(kind, x) &&
+        genericBonusCandidate_v59(kind, x) &&
+        Number(x.PDF금액 || 0) > 0 &&
+        closeMoney(Number(x.PDF금액 || 0), excelAmt, 2000)
+      );
+      if(!candidates.length) continue;
+
+      const best = candidates.sort((p,q)=>Math.abs(Number(p.PDF금액||0)-excelAmt)-Math.abs(Number(q.PDF금액||0)-excelAmt))[0];
+      const pdfAmt = Number(best.PDF금액 || 0);
+      const name = displayItemName_v61 ? displayItemName_v61(best) : cleanItemName(best.항목 || '상여금');
+      const result = closeMoney(pdfAmt, excelAmt, 2000)
+        ? `개별편성확인(금액일치: ${name || '상여금'})`
+        : `개별편성확인(${fmt(Math.abs(Math.round(excelAmt - pdfAmt)))} 차이: ${name || '상여금'})`;
+
+      const targetName = norm(`${kind} ${a.항목}`);
+      let replaced = false;
+      res.details = (res.details || []).map(d => {
+        if(norm(d.항목 || '') === targetName){
+          replaced = true;
+          return {...d, PDF금액: pdfAmt, PDF인원: Number(best.인원 || 0) || d.PDF인원 || '', 검토결과: result};
+        }
+        return d;
+      });
+      if(!replaced){
+        res.details.push({항목:`${kind} ${a.항목}`, 엑셀금액:excelAmt, 엑셀인원:a[peopleField]||'', PDF금액:pdfAmt, PDF인원:Number(best.인원||0)||'', 검토결과:result});
+      }
+      res.missing = (res.missing || []).filter(m => norm(m.항목 || '') !== norm(a.항목 || ''));
+      if(!(res.direct || []).some(m => norm(m.항목 || '') === norm(a.항목 || ''))) res.direct = [...(res.direct || []), a];
     }
+    res.missingSum = (res.missing || []).reduce((s,a)=>s+Number(a?.[amountField]||0),0);
+    if(!(res.missing || []).length) res.verdict = '개별 또는 총액 확인';
+  }catch(e){
+    console.warn('v62 bonus postprocess skipped', e);
   }
   return res;
-}
-
-function addOffMokDiffIssues_v50(issues, calcs, checks){
-  const seen = new Set(issues.map(i=>i.지적내용+'|'+i.근거));
-  for(const c of checks){
-    const cat = norm(c.category || c.expectedMok || '');
-    // 수당 차액은 금액만 맞는 행사비/교육활동비 조합과 우연히 일치하는 경우가 많아 지적사항 자동 오편성 탐색에서 제외합니다.
-    if(/수당/.test(cat)) continue;
-    const diff = amountDiff(c.excelAmount, c.pdfAmount);
-    if(closeMoney(diff,0)) continue;
-    const matches = findOffMokMatches(calcs, c.expectedMok, diff, c.category);
-    for(const x of matches){
-      const item = (typeof displayItemName_v61 === 'function') ? displayItemName_v61(x) : cleanItemName(x.항목 || c.category);
-      const detail = `${item} ${fmt(x.PDF금액)}을 ${c.expectedMok}이 아닌 ${x.목 || x.상위항목 || '다른 목'}에 편성`;
-      const basis = `${c.category} 차액 ${fmt(Math.abs(diff))}과 일치. PDF ${x.페이지 || ''}쪽 산출기초: ${x.산출기초 || ''}`;
-      const key = detail+'|'+basis; if(seen.has(key)) continue;
-      seen.add(key); issues.push({번호:issues.length+1, 지적내용:detail, 근거:basis});
-    }
-  }
-}
+};
