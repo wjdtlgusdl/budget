@@ -2870,3 +2870,177 @@ v63FindExactAllowanceCalc = function(kind, allowanceName, excelAmt, pdfItems, us
   candidates.sort((a,b)=>b.labelLen-a.labelLen);
   return candidates[0]?.x || null;
 };
+
+/* ===== v66 최종 승인 normalize + 보수표 loose fallback =====
+   - v65에서 PDF 금액은 찾았지만 통합편성 fallback으로 떨어지는 수당을 개별편성으로 최종 승격합니다.
+   - 엑셀 보수표가 숨김행/수식/병합헤더 때문에 구조 파싱에 실패할 때, 표시 텍스트 기반 loose parser를 한 번 더 시도합니다.
+*/
+function v66SemanticAllowanceMatch(kind, allowanceName, x){
+  if(!x || x.구분 !== '산출기초') return false;
+  if(!isRightAllowanceMok_v59(kind, x)) return false;
+  const keys = allowanceKeys(allowanceName);
+  const labelText = `${x.항목 || ''} ${x.산출기초 || ''} ${displayItemName_v61 ? displayItemName_v61(x) : ''}`;
+  const labelKeys = allowanceKeys(labelText);
+  if(keys.some(k => labelKeys.some(lk => sameAllowanceKeyForMatch(k, lk)))) return true;
+  // 접두어가 붙은 항목은 핵심 명칭이 산출내역 안에 직접 들어 있으면 개별편성으로 인정
+  const excelCore = allowanceKey(allowanceName);
+  const labelNorm = norm(labelText);
+  if(excelCore === '연구' && /연구/.test(labelNorm)) return true;
+  if(excelCore === '근속' && /(정근|근속)/.test(labelNorm)) return true;
+  if(excelCore === '휴가' && /(휴가|명절방학)/.test(labelNorm)) return true;
+  if(excelCore === '정액급식' && /(정액급식|급식수당|식대)/.test(labelNorm)) return true;
+  if(excelCore === '직책급' && /직책/.test(labelNorm)) return true;
+  if(excelCore === '직급' && /직급/.test(labelNorm)) return true;
+  if(excelCore === '상여' && /상여/.test(labelNorm) && !/(성과|스승)/.test(labelNorm)) return true;
+  if(excelCore === '시간외' && /(시간외|연장근로|연장수당|초과)/.test(labelNorm)) return true;
+  if(excelCore === '자가운전' && /(자가운전|교통보조|운전수당|교통비)/.test(labelNorm)) return true;
+  return false;
+}
+
+function v66FindAllowanceCalc(kind, allowanceName, excelAmt, pdfItems, usedIds){
+  const candidates = [];
+  for(const x of (pdfItems || [])){
+    if(!x || x.구분 !== '산출기초') continue;
+    if(!isRightAllowanceMok_v59(kind, x)) continue;
+    const amt = Number(x.PDF금액 || 0);
+    if(!amt || !closeMoney(amt, excelAmt, 2000)) continue;
+    const id = `${x.페이지}|${x.행}|${x.목}|${x.항목}|${x.PDF금액}`;
+    if(usedIds && usedIds.has(id)) continue;
+    if(!v66SemanticAllowanceMatch(kind, allowanceName, x)) continue;
+    const display = displayItemName_v61 ? displayItemName_v61(x) : cleanItemName(x.항목 || '');
+    candidates.push({x, id, labelLen:norm(display).length});
+  }
+  candidates.sort((a,b)=>b.labelLen-a.labelLen);
+  return candidates[0]?.x || null;
+}
+
+const __analyzeAllowances_base_v66 = analyzeAllowances;
+analyzeAllowances = function(kind, allowanceRows, pdfItems, groupRowOrTotal){
+  const res = __analyzeAllowances_base_v66(kind, allowanceRows, pdfItems, groupRowOrTotal);
+  try{
+    const amountField = kind === '교원' ? '교원금액' : '직원금액';
+    const peopleField = kind === '교원' ? '교원인원' : '직원인원';
+    const usedIds = new Set();
+    const relevant = (allowanceRows || []).filter(a => Number(a?.[amountField] || 0) > 0);
+    for(const a of relevant){
+      const targetName = norm(`${kind} ${a.항목}`);
+      const current = (res.details || []).find(d => norm(d.항목 || '') === targetName);
+      const needsUpgrade = !current || Number(current.PDF금액 || 0) === 0 || /통합편성/.test(current.검토결과 || '') || /추가확인필요/.test(current.검토결과 || '');
+      if(!needsUpgrade) continue;
+      const excelAmt = Number(a[amountField] || 0);
+      const best = v66FindAllowanceCalc(kind, a.항목, excelAmt, pdfItems, usedIds);
+      if(!best) continue;
+      const id = `${best.페이지}|${best.행}|${best.목}|${best.항목}|${best.PDF금액}`;
+      usedIds.add(id);
+      const pdfAmt = Number(best.PDF금액 || 0);
+      let name = displayItemName_v61 ? displayItemName_v61(best) : cleanItemName(best.항목 || '');
+      const fallback = v63LabelFromAllowanceName ? v63LabelFromAllowanceName(a.항목) : a.항목;
+      if(!name || norm(name).length < 2 || /^(정액|수당|보조비)$/.test(norm(name))) name = fallback;
+      const diff = Math.abs(Math.round(excelAmt - pdfAmt));
+      const result = closeMoney(pdfAmt, excelAmt, 2000)
+        ? `개별편성확인(금액일치: ${name})`
+        : `개별편성확인(${fmt(diff)} 차이: ${name})`;
+      let replaced = false;
+      res.details = (res.details || []).map(d => {
+        if(norm(d.항목 || '') === targetName){
+          replaced = true;
+          return {...d, PDF금액: pdfAmt, PDF인원: Number(best.인원 || 0) || d.PDF인원 || '', 검토결과: result};
+        }
+        return d;
+      });
+      if(!replaced){
+        res.details.push({항목:`${kind} ${a.항목}`, 엑셀금액:excelAmt, 엑셀인원:a[peopleField]||'', PDF금액:pdfAmt, PDF인원:Number(best.인원||0)||'', 검토결과:result});
+      }
+      res.missing = (res.missing || []).filter(m => norm(m.항목 || '') !== norm(a.항목 || ''));
+      if(!(res.direct || []).some(m => norm(m.항목 || '') === norm(a.항목 || ''))) res.direct = [...(res.direct || []), a];
+    }
+    res.missingSum = (res.missing || []).reduce((s,a)=>s+Number(a?.[amountField]||0),0);
+    if(!(res.missing || []).length) res.verdict = '개별 또는 총액 확인';
+  }catch(e){
+    console.warn('v66 allowance final upgrade skipped', e);
+  }
+  return res;
+};
+
+function v66DetectSalaryHeaderLoose(aoa){
+  const maxRows = Math.min(140, aoa.length);
+  const maxCols = effectiveMaxCols(aoa, maxRows);
+  let best = null;
+  for(let r=0; r<maxRows; r++){
+    const row = aoa[r] || [];
+    const nearby = [aoa[r-2], aoa[r-1], row, aoa[r+1]].filter(Boolean);
+    const headerTexts = [];
+    for(let c=0; c<maxCols; c++) headerTexts[c] = nearby.map(rr=>text(rr?.[c])).filter(Boolean).join(' ');
+    const rowText = headerTexts.join(' ');
+    let baseCol = findColInTexts(headerTexts, [/본봉/, /기본급/, /^급여$/, /월급/]);
+    let totalCol = findColInTexts(headerTexts, [/지급액계/, /지급액\s*계/, /월지급액계/, /지급총액/, /총지급액/, /합계/]);
+    let jobCol = findColInTexts(headerTexts, [/직명/, /직위/, /구분/, /직종/]);
+    let nameCol = findColInTexts(headerTexts, [/성명/, /이름/, /직원명/]);
+    let allowanceHits = (rowText.match(/수당|급식|식대|상여|휴가|연구|직책|직급|근속|정근|운전|교통|복리/g)||[]).length;
+    let moneyCols = 0;
+    for(let c=0;c<maxCols;c++){
+      const colVals = [aoa[r+1]?.[c], aoa[r+2]?.[c], aoa[r+3]?.[c]].map(toNum).filter(Boolean);
+      if(colVals.length) moneyCols++;
+    }
+    let score = allowanceHits*2 + moneyCols;
+    if(baseCol>=0) score += 8;
+    if(totalCol>=0) score += 8;
+    if(jobCol>=0) score += 4;
+    if(nameCol>=0) score += 2;
+    if(/교직원|보수|일람|급여기준|보수기준/.test(rowText)) score += 4;
+    if(score > (best?.score ?? -1)) best = {score, headerRow:r, jobCol, nameCol, baseCol, totalCol, headerTexts};
+  }
+  if(!best || best.score < 10) return null;
+  if(best.jobCol < 0) best.jobCol = 0;
+  if(best.nameCol < 0) best.nameCol = Math.max(0, best.jobCol + 1);
+  return best;
+}
+
+function v66ParseSalarySheetLoose(sheetName, aoa){
+  const preview = (aoa||[]).slice(0,80).map((r,i)=>({행:i+1, 내용:(r||[]).map(text).filter(Boolean).join(' | ').slice(0,300)})).filter(x=>x.내용);
+  const detected = v66DetectSalaryHeaderLoose(aoa || []);
+  if(!detected) return {ok:false, sheetName, message:'loose fallback도 보수표 헤더를 찾지 못했습니다.', preview};
+  const {headerRow, jobCol, nameCol, baseCol, totalCol, headerTexts} = detected;
+  const maxRows = Math.min(160, aoa.length);
+  const maxCols = effectiveMaxCols(aoa, maxRows);
+  const allowanceCols = [];
+  const startCol = baseCol >= 0 ? baseCol + 1 : 0;
+  const endCol = totalCol > startCol ? totalCol : maxCols;
+  for(let c=startCol; c<endCol; c++){
+    const h = cleanHeader(headerTexts[c] || headerNameForCol(aoa,c,headerRow) || columnText(aoa,c,Math.min(60,aoa.length)));
+    const key = allowanceKey(h);
+    if(h && key && !/성명|이름|직명|직위|번호|호봉|본봉|기본급|지급액|합계|소계|공제|보험|연금|소득세|주민세|실수령/.test(norm(h))){
+      allowanceCols.push({col:c, name:h});
+    }
+  }
+  const teacherEnd = findRow(aoa, headerRow+1, /소계\s*\(?교원\)?|소계교원|교원\s*소계|교원계/);
+  const staffEnd = findRow(aoa, teacherEnd>=0?teacherEnd+1:headerRow+1, /소계\s*\(?(직원|일반직)\)?|소계직원|소계일반직|직원\s*소계|일반직\s*소계|직원계/);
+  let split = teacherEnd;
+  if(split < 0){
+    split = findRow(aoa, headerRow+1, /(직원|일반직|사무직|조리|차량|영양사)/);
+  }
+  const teacherRows = rowsInRange(aoa, headerRow+1, split>=0?split:staffEnd, {jobCol,nameCol,baseCol:baseCol>=0?baseCol:0,totalCol:totalCol>=0?totalCol:0,allowanceCols});
+  const staffRows = rowsInRange(aoa, split>=0?split+1:headerRow+1, staffEnd, {jobCol,nameCol,baseCol:baseCol>=0?baseCol:0,totalCol:totalCol>=0?totalCol:0,allowanceCols});
+  const teacherSubtotal = teacherEnd>=0 ? parseDataRow(aoa[teacherEnd], {jobCol,nameCol,baseCol:baseCol>=0?baseCol:0,totalCol:totalCol>=0?totalCol:0,allowanceCols}) : null;
+  const staffSubtotal = staffEnd>=0 ? parseDataRow(aoa[staffEnd], {jobCol,nameCol,baseCol:baseCol>=0?baseCol:0,totalCol:totalCol>=0?totalCol:0,allowanceCols}) : null;
+  const summary = summarizeSalary(teacherRows, staffRows, teacherSubtotal, staffSubtotal, allowanceCols);
+  if(!teacherRows.length && !staffRows.length && !summary.수당.length){
+    return {ok:false, sheetName, message:'loose fallback에서 금액 행을 읽지 못했습니다.', preview};
+  }
+  return {ok:true, sheetName, loose:true, message:'표시값 기반 보수표 loose fallback 사용', header:{headerRow:headerRow+1, jobCol:jobCol+1, nameCol:nameCol+1, baseCol:baseCol>=0?baseCol+1:null, totalCol:totalCol>=0?totalCol+1:null, allowanceCols:allowanceCols.map(x=>({열:x.col+1, 이름:x.name}))}, ranges:{teacherStart:headerRow+2, teacherEnd:teacherEnd>=0?teacherEnd+1:null, staffStart:split>=0?split+2:null, staffEnd:staffEnd>=0?staffEnd+1:null}, summary, teacherRows, staffRows, teacherSubtotal, staffSubtotal, preview};
+}
+
+const __parseSalarySheet_base_v66 = parseSalarySheet;
+parseSalarySheet = function(sheetName, aoa){
+  const parsed = __parseSalarySheet_base_v66(sheetName, aoa);
+  if(parsed && parsed.ok) return parsed;
+  try{
+    const loose = v66ParseSalarySheetLoose(sheetName, aoa || []);
+    if(loose && loose.ok){
+      loose.message = (parsed?.message ? parsed.message + ' → ' : '') + loose.message;
+      return loose;
+    }
+  }catch(e){ console.warn('v66 salary loose fallback skipped', e); }
+  return parsed;
+};
+
