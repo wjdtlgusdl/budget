@@ -1177,100 +1177,16 @@ function findAllowancePdfMatches(kind, allowanceName, amount, pdfItems){
     if(x.구분 !== '산출기초') continue;
     if(!keys.some(key => allowancePdfHit(kind, key, amount, x))) continue;
     const pdfAmt = Number(x.PDF금액 || 0);
-    // 금액이 다르더라도 같은 산출내역이면 '차이'로 표시해야 하므로 여기서 제외하지 않습니다.
-    // 합산/분리 편성 여부는 analyzeAllowances 단계의 보강 매칭에서 다시 판단합니다.
+    const excelAmt = Number(amount || 0);
+    // 같은 수당이 [방]/[급]/재원별 등으로 나뉜 경우에는 여러 블록을 합산해야 하므로
+    // 개별 블록은 엑셀 금액 이하이면 허용합니다.
+    if(excelAmt && !(closeMoney(pdfAmt, excelAmt) || pdfAmt <= excelAmt + 1000)) continue;
     const id = `${x.페이지}|${x.행}|${x.목}|${x.항목}|${x.PDF금액}`;
     if(seen.has(id)) continue;
     seen.add(id); matches.push(x);
   }
   return matches;
 }
-
-function allowanceAliasHit(key, textValue){
-  const h = norm(textValue || '');
-  if(!key || !h) return false;
-  switch(key){
-    case '근속': return /근속/.test(h);
-    case '정액급식': return /정액급식|급식수당|급식비|식대/.test(h);
-    case '직급': return /직급/.test(h) && !/직책/.test(h);
-    case '직책급': return /직책|직책급/.test(h);
-    case '연구': return /연구|연구활동/.test(h);
-    case '시간외': return /시간외|연장근로|연장수당/.test(h);
-    case '자가운전': return /자가운전|교통보조|운전수당|교통비/.test(h);
-    case '관리업무': return /관리업무/.test(h);
-    case '기타': return /기타수당/.test(h);
-    case '상여': return /상여금|상여/.test(h) && !/성과상여|스승의날|명절휴가|방학휴가/.test(h);
-    case '성과상여': return /성과상여/.test(h);
-    case '스승의날상여': return /스승의날/.test(h);
-    case '명절휴가': return /명절휴가|명절/.test(h);
-    case '방학휴가': return /방학휴가|방학/.test(h);
-    default: return h.includes(norm(key));
-  }
-}
-
-function calcKindScopeOk(kind, x){
-  const h = norm(`${x?.목 || ''} ${x?.상위항목 || ''} ${x?.항목 || ''} ${x?.산출기초 || ''}`);
-  const allowanceMok = kind === '교원' ? '교원수당' : '직원수당';
-  if(h.includes(norm(allowanceMok))) return true;
-  if(kind === '교원'){
-    if(/직원|사무직원|조리직원|영양사|환경미화|차량기사|보조교사/.test(h)) return false;
-    return /교원|교사|원장|부원장|방과후/.test(h) || /수당|상여|휴가|급식|연구|직급|직책|근속|운전|교통/.test(h);
-  }
-  if(/교원|교사|원장|부원장/.test(h)) return false;
-  return /직원|사무직원|조리직원|영양사|환경미화|차량기사|보조교사|수당|상여|휴가|급식|직급|직책|근속/.test(h);
-}
-
-function uniqueCalcRows(rows){
-  const out=[]; const seen=new Set();
-  for(const x of rows || []){
-    const id = `${x.페이지}|${x.행}|${x.목}|${x.항목}|${x.PDF금액}|${x.산출기초}`;
-    if(seen.has(id)) continue;
-    seen.add(id); out.push(x);
-  }
-  return out;
-}
-
-function bestSubsetClose(candidates, target){
-  const arr = uniqueCalcRows(candidates).filter(x=>Number(x.PDF금액||0)>0);
-  if(!target || !arr.length) return [];
-  const exact = arr.filter(x=>closeMoney(Number(x.PDF금액||0), target));
-  if(exact.length) return [exact.sort((a,b)=>String(a.항목||'').length-String(b.항목||'').length)[0]];
-  const n = Math.min(arr.length, 14);
-  let best = null;
-  for(let mask=1; mask < (1<<n); mask++){
-    let sum=0, set=[];
-    for(let i=0;i<n;i++) if(mask & (1<<i)){ sum += Number(arr[i].PDF금액||0); set.push(arr[i]); }
-    const diff = Math.abs(sum - target);
-    if(!best || diff < best.diff || (diff === best.diff && set.length < best.set.length)) best = {diff,set,sum};
-    if(closeMoney(sum, target)) return set;
-  }
-  // 정확한 부분합이 없더라도 가장 가까운 개별 항목은 '차이' 표시를 위해 반환합니다.
-  if(best && best.set.length === 1) return best.set;
-  return [];
-}
-
-function findAllowancePdfMatchesRobust(kind, allowanceName, amount, pdfItems){
-  const direct = findAllowancePdfMatches(kind, allowanceName, amount, pdfItems);
-  const directSum = sumAmount(direct);
-  if(direct.length && (closeMoney(directSum, amount) || direct.length === 1)) return direct;
-
-  const keys = allowanceKeys(allowanceName);
-  if(!keys.length) return direct;
-  const candidates = [];
-  for(const x of pdfItems || []){
-    if(x.구분 !== '산출기초') continue;
-    if(LEGAL_RE.test(x.항목 || '')) continue;
-    if(!calcKindScopeOk(kind, x)) continue;
-    const hay = `${x.목 || ''} ${x.상위항목 || ''} ${x.항목 || ''} ${x.산출기초 || ''}`;
-    const hit = keys.some(k => allowanceAliasHit(k, hay) || allowanceKeys(hay).some(hk => sameAllowanceKeyForMatch(k, hk)));
-    if(!hit) continue;
-    candidates.push(x);
-  }
-  const subset = bestSubsetClose(candidates, Number(amount||0));
-  if(subset.length) return subset;
-  return direct.length ? direct : uniqueCalcRows(candidates);
-}
-
 function integratedText(kind, list, amountField, groupLabel, groupAmount){
   const expr = list.map(a=>`${a.항목}(${fmt(a[amountField])})`).join(' + ');
   return `${expr} = ${groupLabel}(${fmt(groupAmount)})으로 통합편성 추정`;
@@ -1449,7 +1365,7 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupRowOrTotal){
 
   for(const a of relevant){
     const amount = Number(a[amountField]||0);
-    const matches = findAllowancePdfMatchesRobust(kind, a.항목, amount, pdfItems);
+    const matches = findAllowancePdfMatches(kind, a.항목, amount, pdfItems);
     const pdfAmount = matches.reduce((s,x)=>s+Number(x.PDF금액||0),0);
     const pdfPeople = matches.reduce((s,x)=>s+Number(x.인원||0),0);
     if(matches.length){
@@ -1593,8 +1509,6 @@ function allowanceKey(s){
   if(/교통보조|교통비|자가운전|자가차량|차량유지|운전수당/.test(k)) return '자가운전';
   if(/직급보조|직급수당/.test(k)) return '직급';
   if(/직책급|직책/.test(k)) return '직책급';
-  if(/관리업무/.test(k)) return '관리업무';
-  if(/기타수당|기타/.test(k)) return '기타';
   if(/근속/.test(k)) return '근속';
   if(/성과상여/.test(k)) return '성과상여';
   if(/명절휴가/.test(k)) return '명절휴가';
