@@ -124,7 +124,7 @@ function selectedSalaryScore(report){
 
 async function parseExcelWithRawXml(fileName, originalBuf){
   const rawBook = await readXlsxRawWorkbook(originalBuf);
-  const visible = rawBook.sheets.filter(s=>!s.hidden);
+  const visible = rawBook.sheets; // v64: 숨김 시트도 포함
   const candidates = visible.map(s=>({ ...s, score: sheetScore(s.name) }))
     .filter(s=>s.score>0).sort((a,b)=>b.score-a.score);
   let salary = null;
@@ -161,7 +161,7 @@ async function parseExcelWithSheetJS(fileName, originalBuf){
     dense:false
   });
   const sheetMeta = (wb.Workbook && wb.Workbook.Sheets) || [];
-  const visible = wb.SheetNames.map((name,i)=>({name, hidden: sheetMeta[i]?.Hidden || 0})).filter(s=>!s.hidden);
+  const visible = wb.SheetNames.map((name,i)=>({name, hidden: sheetMeta[i]?.Hidden || 0})); // v64: 숨김 시트도 화면값 기반 검토 대상으로 포함
   const candidates = visible.map(s=>({ ...s, score: sheetScore(s.name) })).filter(s=>s.score>0).sort((a,b)=>b.score-a.score);
   let salary = null;
   const tried = [];
@@ -1714,9 +1714,9 @@ async function parseExcel(file){
 
 async function parseExcelWithSheetJS_v50(fileName, originalBuf){
   const normalizedBuf = await normalizeXlsxForSheetJS(originalBuf);
-  const wb = XLSX.read(normalizedBuf, {type:'array', cellDates:false, cellNF:false, cellText:true, raw:false, WTF:false, dense:false});
+  const wb = XLSX.read(normalizedBuf, {type:'array', cellDates:false, cellNF:true, cellStyles:true, cellText:true, cellFormula:true, raw:false, WTF:false, dense:false});
   const sheetMeta = (wb.Workbook && wb.Workbook.Sheets) || [];
-  const visible = wb.SheetNames.map((name,i)=>({name, hidden: sheetMeta[i]?.Hidden || 0})).filter(s=>!s.hidden);
+  const visible = wb.SheetNames.map((name,i)=>({name, hidden: sheetMeta[i]?.Hidden || 0})); // v64: 숨김 시트도 화면값 기반 검토 대상으로 포함
   const sheetAoas = new Map();
   const candidates = visible.map(s=>{
     const aoa = sheetToAoaRobust_v50(wb.Sheets[s.name]);
@@ -1738,7 +1738,7 @@ async function parseExcelWithSheetJS_v50(fileName, originalBuf){
 
 async function parseExcelWithRawXml_v50(fileName, originalBuf){
   const rawBook = await readXlsxRawWorkbook(originalBuf);
-  const visible = rawBook.sheets.filter(s=>!s.hidden);
+  const visible = rawBook.sheets; // v64: 숨김 시트도 포함
   const aoaMap = new Map();
   for(const s of visible){ try{ aoaMap.set(s.name, await rawBook.getAoa(s.name)); }catch(e){ aoaMap.set(s.name, []); } }
   const candidates = visible.map(s=>({...s, score:sheetScore_v50(s.name, aoaMap.get(s.name)||[])})).filter(s=>s.score>0).sort((a,b)=>b.score-a.score);
@@ -1756,7 +1756,7 @@ async function parseExcelWithRawXml_v50(fileName, originalBuf){
 
 function sheetScore_v50(name, aoa){
   let score = sheetScore(name);
-  const joined = (aoa || []).slice(0,120).map(r=>(r||[]).map(text).join(' ')).join(' ');
+  const joined = (aoa || []).slice(0,250).map(r=>(r||[]).map(text).join(' ')).join(' ');
   const n = norm(joined);
   if(/교직원.*보수|보수.*일람|보수기준|급여기준|직명.*성명|본봉|기본급|지급액계|월지급액|소계교원|소계직원|소계일반직/.test(n)) score += 90;
   if(/직명/.test(n) && (/본봉|기본급/.test(n)) && /지급액/.test(n)) score += 100;
@@ -1765,25 +1765,41 @@ function sheetScore_v50(name, aoa){
   return Math.max(0, score);
 }
 function sheetContentHit(aoa, re){
-  const joined = (aoa || []).slice(0,100).map(r=>(r||[]).map(text).join(' ')).join(' ');
+  const joined = (aoa || []).slice(0,250).map(r=>(r||[]).map(text).join(' ')).join(' ');
   return re.test(joined);
 }
 
 function sheetToAoaRobust_v50(ws){
   if(!ws || !ws['!ref']) return [];
-  const aoa = sheetToAoaRobust(ws);
+  // v64: 엑셀의 구조/숨김/수식 여부보다 '셀에 표시되는 글자와 숫자'를 최대한 평탄화해서 읽습니다.
+  const aoa = XLSX.utils.sheet_to_json(ws, {header:1, raw:false, defval:'', blankrows:true});
   let range;
   try{ range = XLSX.utils.decode_range(ws['!ref']); }catch(e){ return aoa; }
-  const maxR = Math.min(range.e.r, 200), maxC = Math.min(range.e.c, 260);
+  const maxR = Math.min(range.e.r, 500), maxC = Math.min(range.e.c, 320);
   for(let R=range.s.r; R<=maxR; R++){
     if(!aoa[R]) aoa[R]=[];
     for(let C=range.s.c; C<=maxC; C++){
-      if(aoa[R][C] !== undefined && aoa[R][C] !== '') continue;
       const addr = XLSX.utils.encode_cell({r:R,c:C}); const cell = ws[addr];
-      if(!cell) continue;
-      if(cell.w !== undefined && cell.w !== '') aoa[R][C]=cell.w;
-      else if(cell.v !== undefined && cell.v !== '') aoa[R][C]=cell.v;
-      else if(cell.f) aoa[R][C]=evaluateSimpleFormula(ws, cell.f);
+      if(cell){
+        // 표시문자(.w)를 최우선, 계산된 값(.v), 단순 수식 평가 순으로 보완
+        let val = '';
+        if(cell.w !== undefined && cell.w !== '') val = cell.w;
+        else if(cell.v !== undefined && cell.v !== '') val = cell.v;
+        else if(cell.f) val = evaluateSimpleFormula(ws, cell.f);
+        if((aoa[R][C] === undefined || aoa[R][C] === '') && val !== '') aoa[R][C]=val;
+      }
+    }
+  }
+  // 병합셀 보정: 병합영역의 좌상단 표시값을 병합된 모든 셀에 복제
+  const merges = ws['!merges'] || [];
+  for(const m of merges){
+    const top = aoa[m.s.r]?.[m.s.c];
+    if(top === undefined || top === '') continue;
+    for(let R=m.s.r; R<=Math.min(m.e.r,maxR); R++){
+      if(!aoa[R]) aoa[R]=[];
+      for(let C=m.s.c; C<=Math.min(m.e.c,maxC); C++){
+        if(aoa[R][C] === undefined || aoa[R][C] === '') aoa[R][C]=top;
+      }
     }
   }
   return aoa;
