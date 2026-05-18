@@ -714,7 +714,8 @@ async function parsePdf(file){
     const grouped = groupPdfLines(items).map(l=>({...l, page:p}));
     pages.push({page:p, lineCount:grouped.length}); lines.push(...grouped);
   }
-  const items = extractBudgetItems(lines);
+  let items = extractBudgetItems(lines);
+  items = enrichBudgetItemsFromSplitLines(lines, items);
   return { fileName:file.name, pageCount:pdf.numPages, lines:lines.map(l=>({페이지:l.page, y:l.y, 텍스트:l.text})), items };
 }
 function groupPdfLines(items){
@@ -748,6 +749,93 @@ function extractBudgetItems(lines){
   }
   return out.filter(x=>!LEGAL_RE.test(x.항목));
 }
+
+function budgetItemId(x){
+  return [x.구분||'', x.페이지||'', norm(x.목||x.상위항목||''), norm(cleanItemName(x.항목||'')), Math.round(Number(x.PDF금액||0))].join('|');
+}
+function likelySplitNameLine(s){
+  const t = text(s||'');
+  if(!t || /\(본예산\)|=|\*/.test(t)) return false;
+  if(parseTotalBudgetRow(t)) return false;
+  if(/발행일|예산구분|과\s*목|산출내역|산출기초|보조금|수익자|합계/.test(t)) return false;
+  return /퇴직|급보조비|구수당|장근로수당|급식비|통보조비|절휴가비|근속수당|상여금|기타수당|직적립금|본급|립금/.test(t.replace(/\s+/g,''));
+}
+function recoverSplitTotalRows(lines, existing){
+  const out=[];
+  const seen = new Set((existing||[]).map(budgetItemId));
+  for(let i=0;i<lines.length-2;i++){
+    const a = text(lines[i].text||''), b = text(lines[i+1].text||''), c = text(lines[i+2].text||'');
+    if(lines[i].page !== lines[i+1].page || lines[i].page !== lines[i+2].page) continue;
+    const compactName = norm(a + c);
+    if(!/퇴직/.test(compactName)) continue;
+    const nums = [...b.matchAll(/-?[0-9]{1,3}(?:,[0-9]{3})*|-?[0-9]+/g)].map(m=>toNum(m[0]));
+    // 세출명세서 총액행의 재원별 숫자 4개를 우선 사용합니다.
+    if(nums.length < 4) continue;
+    const name = normalizeMokName(a + c);
+    if(!validBudgetRowName(name)) continue;
+    const item = {페이지:lines[i].page, 행:i+1, 목:name, 상위항목:'', 항목:name, PDF금액:nums[3]*1000, PDF금액천원:nums[3], 보조금금액:nums[0]*1000, 수익자금액:nums[1]*1000, 기타금액:nums[2]*1000, 인원:null, 산출기초:'', 구분:'총액행', 보정:'split-total'};
+    const id = budgetItemId(item);
+    if(!seen.has(id)){ seen.add(id); out.push(item); }
+  }
+  return out;
+}
+function recoverSplitCalcRows(lines, existing){
+  const out=[];
+  const seen = new Set((existing||[]).map(budgetItemId));
+  let currentTotal = null;
+  for(let i=0;i<lines.length;i++){
+    const t = text(lines[i].text||'');
+    const total = parseTotalBudgetRow(t);
+    if(total) currentTotal = {항목:total.항목, 페이지:lines[i].page, 행:i+1, 금액:total.금액};
+    // split total row such as 교원퇴직금및퇴직적 / number row / 립금
+    if(i+2<lines.length && lines[i].page===lines[i+2].page){
+      const combined = norm((lines[i].text||'') + (lines[i+2].text||''));
+      if(/퇴직/.test(combined)){
+        const nums = [...String(lines[i+1].text||'').matchAll(/-?[0-9]{1,3}(?:,[0-9]{3})*|-?[0-9]+/g)].map(m=>toNum(m[0]));
+        if(nums.length>=4) currentTotal = {항목:normalizeMokName(String(lines[i].text||'')+String(lines[i+2].text||'')), 페이지:lines[i].page, 행:i+1, 금액:nums[3]*1000};
+      }
+    }
+    if(!/\(본예산\)|[0-9,]+\s*원?\s*\*/.test(t)) continue;
+    if(!/=\s*$|=\s*[^0-9]*$|[0-9,]+\s*원?\s*\*/.test(t)) continue;
+    const buf=[t];
+    let end=i;
+    for(let k=i+1;k<Math.min(lines.length,i+8);k++){
+      if(lines[k].page !== lines[i].page) break;
+      const s = text(lines[k].text||'');
+      if(!s) continue;
+      if(k>i && parseTotalBudgetRow(s)) break;
+      if(k>i && /\(본예산\)/.test(s)) break;
+      buf.push(s); end=k;
+      const joined = buf.join(' ').replace(/\s+/g,' ').trim();
+      const calc = parseCalcLine(joined);
+      if(calc && Number(calc.amount||0)>0){
+        let name = calc.name || knownCalcNameFromBasis(joined) || findCalcName(lines, i) || findCalcName(lines, end) || currentTotal?.항목 || '산출항목미상';
+        // 줄바꿈으로 첫 글자가 앞줄에 붙고 나머지가 다음 줄로 넘어간 항목 보정
+        const known = knownCalcNameFromBasis(joined);
+        if(known) name = known;
+        name = cleanItemName(name);
+        const item = {페이지:lines[i].page, 행:i+1, 목:currentTotal?.항목 || '', 상위항목:currentTotal?.항목 || '', 항목:name, PDF금액:calc.amount, PDF금액천원:Math.round(calc.amount/1000), 인원:calc.people, 누락항목:calc.missing || [], 산출기초:joined, 구분:'산출기초', 보정:'split-calc'};
+        const id = budgetItemId(item);
+        if(!seen.has(id)){ seen.add(id); out.push(item); }
+        break;
+      }
+      // 금액 줄까지 왔는데 항목명만 있고 산식이 아니면 계속 보지 않습니다.
+      if(k>i && /[0-9]{1,3}(?:,[0-9]{3})+\s*$/.test(s) && likelySplitNameLine(s)) break;
+    }
+  }
+  return out;
+}
+function enrichBudgetItemsFromSplitLines(lines, items){
+  const base = Array.isArray(items) ? items.slice() : [];
+  const additions = [...recoverSplitTotalRows(lines, base), ...recoverSplitCalcRows(lines, base)];
+  const seen = new Set(base.map(budgetItemId));
+  for(const x of additions){
+    const id = budgetItemId(x);
+    if(!seen.has(id)){ seen.add(id); base.push(x); }
+  }
+  return base.filter(x=>!LEGAL_RE.test(x.항목));
+}
+
 function isCalcStartCandidate(t){
   const s = text(t || '');
   if(!s) return false;
@@ -839,6 +927,7 @@ function knownCalcNameFromBasis(t){
     ['방학휴가비', /방학휴가비/],
     ['명절휴가비', /명절휴가비|절휴가비/],
     ['상여금', /(^|[^가-힣])(상여금)([^가-힣]|$)|\s상여금|상여금/],
+    ['퇴직적립금', /퇴직적립금|직적립금|퇴직금및퇴직적립|퇴직금/],
     ['기본급(영양사)', /기본급\s*\(?영양사\)?|영양사급여/],
     ['차량기사급여', /차량기사급여|기사급여/],
   ];
@@ -1089,6 +1178,7 @@ function cleanItemName(name){
   if(/^량주유/.test(s)) s = '차' + s;
   if(/^량운영/.test(s)) s = '차' + s;
   if(/^량임차/.test(s)) s = '차' + s;
+  if(/^직적립금/.test(s)) s = '퇴' + s;
   return s;
 }
 
@@ -1259,7 +1349,7 @@ function addPayBreakdownRows(rows, kind, salaryObj, payCalcs, allCalcs){
 
 function isRetirementName(s){
   const n = norm(s || '');
-  return /퇴직/.test(n) && /(적립|퇴직금|충당|급여|퇴직)/.test(n);
+  return /(퇴직|직적립)/.test(n) && /(적립|직적립|퇴직금|충당|급여|퇴직)/.test(n);
 }
 function getExcelRetirementSummary(retirementSheets){
   const sheets = retirementSheets || [];
