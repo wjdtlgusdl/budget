@@ -914,6 +914,25 @@ function findCalcName(lines, idx){
 }
 
 
+function offMokMatchScore(x, category, expectedMok){
+  const label = norm(`${cleanItemName(x?.항목 || '')} ${x?.산출기초 || ''} ${x?.목 || x?.상위항목 || ''}`);
+  const cat = norm(category || expectedMok || '');
+  let score = 0;
+  if(/직원급여|급여/.test(cat)){
+    if(/차량기사급여|기사급여|운전.*급여|급여.*기사/.test(label)) score += 100;
+    if(/급여|인건비|보수/.test(label)) score += 35;
+    if(/주유|유류|운영비|수리|보험|임차료/.test(label)) score -= 25;
+  }
+  if(/교원급여/.test(cat) && /교원급여|교사급여|원장급여|방과후교원급여/.test(label)) score += 80;
+  if(/수당/.test(cat) && /(수당|상여|휴가|급식|자가운전|직급|직책|연구|관리업무)/.test(label)) score += 50;
+  // 항목명에 category의 의미어가 직접 포함되면 보강
+  for(const token of ['차량기사','보조교사','조리직원','사무직원','환경미화','영양사','교원','직원']){
+    if(cat.includes(norm(token)) && label.includes(norm(token))) score += 30;
+  }
+  return score;
+}
+
+
 function findOffMokMatches(calcs, expectedMok, diff, category){
   const absDiff = Math.abs(Number(diff||0));
   if(absDiff <= 1000) return [];
@@ -936,7 +955,12 @@ function findOffMokMatches(calcs, expectedMok, diff, category){
     if(isAllowance) return /(수당|상여|휴가비|식대|정액급식|자가운전|직급|직책|연구|관리업무)/.test(label);
     return true;
   });
-  if(direct.length) return direct;
+  if(direct.length){
+    // 같은 금액의 산출내역이 여러 개 있으면 금액만 보지 않고 명칭 유사도를 우선합니다.
+    // 예: 18,000,000원이 차량주유비와 차량기사급여에 모두 있을 때, 직원급여 차액은 차량기사급여를 우선 선택.
+    direct.sort((a,b)=>offMokMatchScore(b, category, expectedMok) - offMokMatchScore(a, category, expectedMok));
+    return direct;
+  }
 
   // v49: 차액이 한 산출항목이 아니라 같은 목 안의 여러 산출항목 합계와 일치하는 경우를 잡습니다.
   // 예: 직원급여 차액 69,300,000원 = 통학차량이용비 목의 통학차량임차료(수익자) 2,004,000원 + 통학차량임차료 67,296,000원
@@ -1009,8 +1033,12 @@ function pdfPeopleKey(x){
 
 function cleanItemName(name){
   let s = String(name || '').trim();
+  // pdf.js가 '차량...'의 첫 글자 '차'를 앞 블록으로 떼어내는 경우 보정
   if(/^량기사/.test(s)) s = '차' + s;
   if(/^량보조/.test(s)) s = '차' + s;
+  if(/^량주유/.test(s)) s = '차' + s;
+  if(/^량운영/.test(s)) s = '차' + s;
+  if(/^량임차/.test(s)) s = '차' + s;
   return s;
 }
 
@@ -1034,8 +1062,8 @@ function detailVerdict(label, excelAmount, pdfAmount, excelPeople, pdfPeople, of
     if(offMatches && offMatches.length){
       const m=offMatches[0];
       const itemName = cleanItemName(m.항목);
-      const offText = (/직원급여/.test(label) && /통학차량|차량임차|임차료/.test(norm((m.목||'') + itemName)))
-        ? `통학차량 기사 급여 ${fmt(m.PDF금액)}을 ${itemName}로 편성`
+      const offText = (/직원급여/.test(label) && /통학차량|차량/.test(norm((m.목||'') + itemName)))
+        ? `${m.목 || m.상위항목} 목의 ${itemName} ${fmt(m.PDF금액)}로 편성`
         : `${m.목 || m.상위항목} 목에 ${itemName} ${fmt(m.PDF금액)} 편성`;
       parts.push(`금액 차이(${label} ${shortWon(Math.abs(diff))} 차이 → ${offText})`);
     }else{
@@ -1055,6 +1083,24 @@ function allowanceGroupCandidates(groupRow, kind){
   if(groupRow.기타금액) out.push({label:`${kind}수당`, amount:Number(groupRow.기타금액||0)});
   return out.filter((x,i,a)=>x.amount && a.findIndex(y=>y.amount===x.amount)===i);
 }
+
+function allowanceIntegratedCalcCandidates(kind, pdfItems){
+  const allowanceMok = kind === '교원' ? '교원수당' : '직원수당';
+  const out=[];
+  for(const x of (pdfItems || [])){
+    if(x.구분 !== '산출기초') continue;
+    const mok = norm(x.목 || x.상위항목 || '');
+    const item = norm(cleanItemName(x.항목 || ''));
+    if(!(mok === allowanceMok || mok.includes(allowanceMok))) continue;
+    // '교원수당', '직원수당'처럼 세부명이 없는 통합 산출내역만 후보로 사용합니다.
+    // 직원정액급식비, 직원명절휴가비 등 개별 산출내역은 이미 direct에서 처리되어야 합니다.
+    if(item === allowanceMok || item === norm(kind + '수당') || allowanceKey(item) === '수당'){
+      out.push({label:cleanItemName(x.항목 || `${kind}수당`), amount:Number(x.PDF금액||0), source:x});
+    }
+  }
+  return out.filter((x,i,a)=>x.amount && a.findIndex(y=>y.amount===x.amount && y.label===x.label)===i);
+}
+
 function allowanceKeys(s){
   const raw = String(s || '');
   const compact = norm(raw);
@@ -1075,7 +1121,7 @@ function allowanceKeys(s){
   if(/직급보조|직급수당/.test(compact)) keys.add('직급');
   if(/직책/.test(compact)) keys.add('직책급');
   if(/근속/.test(compact)) keys.add('근속');
-  if(/상여/.test(compact)) keys.add('상여');
+  // '상여'는 너무 포괄적이어서 스승의날상여금과 성과상여금을 혼동시키므로 보조 키로 추가하지 않습니다.
   return [...keys].filter(Boolean);
 }
 function findAllowancePdfMatches(kind, allowanceName, amount, pdfItems){
@@ -1297,15 +1343,24 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupRowOrTotal){
     .filter(d => /^개별편성/.test(d.검토결과 || ''))
     .reduce((s,d)=>s+Number(d.PDF금액||0),0);
   const residual = Math.max(0, groupTotal - directPdfSum);
-  const candidates = allowanceGroupCandidates(groupRow, kind);
+  // 통합편성 비교는 목 전체 총액이 아니라 산출내역 중 '교원수당/직원수당' 블록 또는
+  // 총액에서 이미 개별확인된 금액을 뺀 잔액만 사용합니다.
+  // 예: 직원수당 목 총액 37,600,000원을 통합수당으로 보지 않고, 산출내역 '직원수당' 6,600,000원만 사용.
+  const candidates = allowanceIntegratedCalcCandidates(kind, pdfItems);
   if(residual) candidates.unshift({label:`${kind}수당 잔액`, amount:residual});
+  // 산출내역 후보가 전혀 없는 예외 파일에서만 재원별 금액을 보조 후보로 사용하되, 목 전체 총액은 제외합니다.
+  if(!candidates.length){
+    for(const c of allowanceGroupCandidates(groupRow, kind).filter(c=>!closeMoney(c.amount, groupTotal))){
+      candidates.push(c);
+    }
+  }
   let matched = null;
   // 미개별 수당이 있으면 전체 수당 총액이 아니라 "교원/직원수당 총액 - 이미 개별확인된 금액" 또는 미개별 수당 합계와 비교합니다.
   if(missingSum) matched = candidates.find(c=>closeMoney(c.amount, missingSum));
   // 미개별 수당이 없는 경우에만 전체 수당 총액 일치를 인정합니다.
   if(!matched && !missing.length && totalExcel) matched = candidates.find(c=>closeMoney(c.amount,totalExcel));
   const coveredByGroup = !!matched;
-  const integratedMessage = coveredByGroup && missing.length ? integratedText(kind, missing, amountField, `${kind}수당`, matched.amount) : '';
+  const integratedMessage = coveredByGroup && missing.length ? integratedText(kind, missing, amountField, matched.label || `${kind}수당`, matched.amount) : '';
 
   for(const a of missing){
     const amount = Number(a[amountField]||0);
@@ -1323,6 +1378,18 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupRowOrTotal){
   else if(missingSum) verdict = `추가확인필요: 미개별표시 수당 합계 ${fmt(missingSum)}, PDF ${kind}수당 ${fmt(groupTotal)}`;
   else verdict = '개별 또는 총액 확인';
   return {kind, amountField, peopleField, relevant, direct, missing, details, totalExcel, missingSum, directSum, groupTotal, groupMatchedAmount:matched?.amount||0, coveredByGroup, verdict};
+}
+
+
+function sameAllowanceKeyForMatch(a,b){
+  if(!a || !b) return false;
+  if(a === b) return true;
+  // 아래 핵심 키워드는 서로 섞이면 안 됩니다.
+  const strict = ['스승의날상여','성과상여','명절휴가','방학휴가','정액급식','시간외','직급','직책급','자가운전','연구','관리업무'];
+  if(strict.includes(a) || strict.includes(b)) return a === b;
+  // '수당'은 통합 산출내역 후보에서만 쓰고 개별 수당 매칭에는 쓰지 않습니다.
+  if(a === '수당' || b === '수당') return false;
+  return a.length >= 3 && b.length >= 3 && (a.includes(b) || b.includes(a));
 }
 
 function allowancePdfHit(kind, key, amount, x){
@@ -1351,7 +1418,7 @@ function allowancePdfHit(kind, key, amount, x){
 
   // v49: PDF 산출내역이 여러 줄로 쪼개지는 파일에서는 x.항목만 보면 '직', '급보조비'처럼 일부가 빠질 수 있습니다.
   // 산출기초 블록 전체(labelText)에서 동의어 키를 다시 추출해 같은 수당 여부를 판단합니다.
-  const keyMatched = labelKeys.some(k => k === key || k.includes(key) || key.includes(k));
+  const keyMatched = labelKeys.some(k => sameAllowanceKeyForMatch(key, k));
   if(!keyMatched) return false;
 
   // 기타수당처럼 일반적인 명칭은 해당 수당 목 안에 있을 때만 인정합니다.
