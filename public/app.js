@@ -2735,3 +2735,138 @@ analyzeAllowances = function(kind, allowanceRows, pdfItems, groupRowOrTotal){
   }
   return res;
 };
+
+/* ===== v65 수당 의미군(alias cluster) 보강 =====
+   - 교원수당/직원수당 내부 개별편성 판단을 항목명 그대로가 아니라 의미군으로 비교합니다.
+   - 예: 직원 휴가비 ↔ 그밖의_명절방학휴가비, 교원 연구보조비 ↔ 유아학비_연구보조비
+   - 기존 정상 케이스 보호를 위해 수당 매칭 범위는 교원수당/직원수당 목 내부로 계속 제한합니다.
+*/
+const __allowanceKey_base_v65 = allowanceKey;
+function __stripAllowancePrefixes_v65(s){
+  let k = norm(s || '');
+  // 재원/사업 접두어 제거: 유아학비_직책수당, 그밖의_명절방학휴가비, 수익자_연수활동비 등
+  k = k.replace(/(?:^|_)(유아학비|그밖의|수익자|보조금및지원금|보조금|교육청|시청|지자체|운영|급|방|수|교|영|놀|만\d세)_?/g, '');
+  // 접두어가 줄바꿈/파싱으로 앞에 붙은 경우를 한 번 더 정리
+  k = k.replace(/^(유아학비|그밖의|수익자|보조금|운영|급|방|수|교|영|놀)(?=(정액|급식|직책|직급|연구|연장|시간외|근속|정근|상여|명절|방학|휴가|복리|운전|교통|기타))/, '');
+  return k;
+}
+
+allowanceKey = function(s){
+  let k = __stripAllowancePrefixes_v65(s);
+  if(!k) return '';
+  k = k.replace(/^(교원|직원|교사|사무직원|조리직원|보조교사|방과후교사|차량기사|차량보조|관리직|영양사)/,'');
+  k = k.replace(/^(방|급|운영|수|교)(?=(근속|정근|급식|기본급|상여|연장|연구|직책|직급|운전|기타|식대|정액급식|휴가))/, '');
+
+  // 급식/식대 계열
+  if(/식대|급식비|정액급식|급식수당|급식보조|교직원급식/.test(k)) return '정액급식';
+  // 근무/초과 계열
+  if(/연장근로|시간외|연장수당|초과근무|야근/.test(k)) return '시간외';
+  // 연구 계열
+  if(/연구보조|연구활동|연구수당|연구비|연구/.test(k)) return '연구';
+  // 운전/교통 계열
+  if(/교통보조|교통비|자가운전|자가차량|차량유지|운전수당/.test(k)) return '자가운전';
+  // 직책/직급 계열은 구분 유지
+  if(/직급보조|직급수당/.test(k)) return '직급';
+  if(/직책급|직책/.test(k)) return '직책급';
+  // 근속/정근 계열은 기관별 표현이 달라 유사 계열로 묶되 표시명은 따로 유지
+  if(/정근|근속/.test(k)) return '근속';
+  // 휴가비 계열: 명절휴가/방학휴가가 각각 따로 있는 경우는 구분, 명절방학휴가비/휴가비는 일반 휴가비로 처리
+  if(/명절.*방학.*휴가|명절방학휴가|휴가비$|^휴가$/.test(k)) return '휴가';
+  if(/명절휴가/.test(k)) return '명절휴가';
+  if(/방학휴가/.test(k)) return '방학휴가';
+  // 상여 계열: 성과/스승의날은 개별 구분, 일반 상여금은 별도
+  if(/성과상여/.test(k)) return '성과상여';
+  if(/스승의날/.test(k)) return '스승의날상여';
+  if(/^상여금?$/.test(k) || /(^|_)상여금?$/.test(k) || k === '상여' || /명절.*상여/.test(k)) return '상여';
+  if(/복리후생|복리/.test(k)) return '복리후생';
+  if(/처우개선/.test(k)) return '처우개선';
+  if(/기타수당|기타/.test(k)) return '기타';
+
+  const stripped = k.replace(/수당|보조금|지원비|지원금|상여금|휴가비|급식비|식대|비/g,'');
+  return stripped || k;
+};
+
+const __allowanceKeys_base_v65 = allowanceKeys;
+allowanceKeys = function(s){
+  const raw = String(s || '');
+  const keys = new Set();
+  raw.split(/[\/,;+·ㆍ&]+|및|와|과/).map(x=>x.trim()).filter(Boolean).forEach(part=>{
+    const k = allowanceKey(part);
+    if(k) keys.add(k);
+  });
+  const k = allowanceKey(raw);
+  if(k) keys.add(k);
+  const compact = norm(raw);
+  // 보조 키: 너무 넓게 섞이지 않는 의미군만 추가합니다.
+  if(/정액급식|급식수당|식대|교직원급식/.test(compact)) keys.add('정액급식');
+  if(/연구보조|연구활동|연구수당/.test(compact)) keys.add('연구');
+  if(/교통보조|자가운전|운전수당|차량유지/.test(compact)) keys.add('자가운전');
+  if(/연장근로|시간외|연장수당|초과근무/.test(compact)) keys.add('시간외');
+  if(/직급보조|직급수당/.test(compact)) keys.add('직급');
+  if(/직책수당|직책급/.test(compact)) keys.add('직책급');
+  if(/정근|근속/.test(compact)) keys.add('근속');
+  if(/명절방학휴가|휴가비/.test(compact) && !/명절휴가비|방학휴가비/.test(compact)) keys.add('휴가');
+  return [...keys].filter(Boolean);
+};
+
+const __sameAllowanceKeyForMatch_base_v65 = sameAllowanceKeyForMatch;
+sameAllowanceKeyForMatch = function(a,b){
+  if(!a || !b) return false;
+  if(a === b) return true;
+  // 방향성 있는 일반 휴가비 매칭: 엑셀 항목이 '휴가'일 때만 명절/방학/명절방학휴가비를 포괄합니다.
+  if(a === '휴가' && ['휴가','명절휴가','방학휴가'].includes(b)) return true;
+  if(b === '휴가' && a !== '휴가') return false;
+  const strict = ['스승의날상여','성과상여','명절휴가','방학휴가','정액급식','시간외','직급','직책급','자가운전','연구','관리업무','근속','상여','복리후생','처우개선'];
+  if(strict.includes(a) || strict.includes(b)) return a === b;
+  if(a === '수당' || b === '수당') return false;
+  return a.length >= 3 && b.length >= 3 && (a.includes(b) || b.includes(a));
+};
+
+const __cleanItemName_base_v65 = cleanItemName;
+cleanItemName = function(name){
+  let s = __cleanItemName_base_v65(name);
+  const n = norm(s);
+  if(/^액급식비/.test(n)) return '정액급식비';
+  if(/명절방학휴가/.test(n)) return '명절방학휴가비';
+  if(/^구보조비/.test(n)) return '연구보조비';
+  if(/^책수당/.test(n)) return '직책수당';
+  if(/^근수당/.test(n)) return '정근수당';
+  return s;
+};
+
+const __displayItemName_v61_base_v65 = displayItemName_v61;
+displayItemName_v61 = function(x){
+  const raw = `${x?.항목 || ''} ${x?.산출기초 || ''}`;
+  const n = norm(raw);
+  const base = __displayItemName_v61_base_v65(x);
+  if(/명절방학휴가/.test(n)) return '명절방학휴가비';
+  if(/정액급식|액급식비/.test(n)) return '정액급식비';
+  if(/연구보조/.test(n)) return '연구보조비';
+  if(/직책수당|책수당/.test(n)) return '직책수당';
+  if(/정근수당|근수당/.test(n)) return '정근수당';
+  if(/상여금|상여/.test(n) && !/성과|스승/.test(n)) return '상여금';
+  return base;
+};
+
+// v63의 정확 일치 승격 후보 판정에서 의미군을 조금 더 엄격하게 사용합니다.
+const __v63FindExactAllowanceCalc_base_v65 = v63FindExactAllowanceCalc;
+v63FindExactAllowanceCalc = function(kind, allowanceName, excelAmt, pdfItems, usedIds){
+  const keys = allowanceKeys(allowanceName);
+  const candidates = [];
+  for(const x of (pdfItems || [])){
+    if(!x || x.구분 !== '산출기초') continue;
+    if(!isRightAllowanceMok_v59(kind, x)) continue;
+    if(v63IsGenericAllowanceCalc(kind, x)) continue;
+    const amt = Number(x.PDF금액 || 0);
+    if(!amt || !closeMoney(amt, excelAmt, 2000)) continue;
+    const id = `${x.페이지}|${x.행}|${x.목}|${x.항목}|${x.PDF금액}`;
+    if(usedIds && usedIds.has(id)) continue;
+    const labelKeys = allowanceKeys(`${x.항목 || ''} ${x.산출기초 || ''}`);
+    const semantic = keys.some(k => labelKeys.some(lk => sameAllowanceKeyForMatch(k, lk)) || allowanceCandidateByKey_v59(kind, k, x) || allowancePdfHit(kind, k, excelAmt, x));
+    if(!semantic) continue;
+    const display = norm(displayItemName_v61 ? displayItemName_v61(x) : cleanItemName(x.항목 || ''));
+    candidates.push({x, id, semantic, labelLen:display.length});
+  }
+  candidates.sort((a,b)=>b.labelLen-a.labelLen);
+  return candidates[0]?.x || null;
+};
