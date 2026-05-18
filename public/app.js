@@ -756,7 +756,7 @@ function isCalcStartCandidate(t){
 function collectCalcBlock(lines, startIdx){
   const buf=[];
   const startPage = lines[startIdx]?.page;
-  const maxEnd = Math.min(lines.length-1, startIdx + 10);
+  const maxEnd = Math.min(lines.length-1, startIdx + 22);
   for(let k=startIdx;k<=maxEnd;k++){
     const lt = lines[k];
     if(!lt || lt.page !== startPage) break;
@@ -815,6 +815,45 @@ function validBudgetRowName(name){
   if(/^[\d,\-]+$/.test(name)) return false;
   return true;
 }
+
+function knownCalcNameFromBasis(t){
+  const raw = text(t || '');
+  const compact = norm(raw);
+  const patterns = [
+    ['[방]근속수당', /\[방\]\s*근속수당|방근속수당/],
+    ['근속수당', /(?<!방)근속수당/],
+    ['[방]급식수당', /\[방\]\s*급식수당|방급식수당/],
+    ['급식수당', /(?<!방)급식수당|정액급식비|교원정액급식비|직원정액급식비/],
+    ['직책수당', /직책수당|직책급업무추진비/],
+    ['직급보조비', /직급보조비|직급수당/],
+    ['연구수당', /연구수당|연구활동비|연구비/],
+    ['연장수당', /연장수당|연장근로수당|시간외수당/],
+    ['운전수당', /운전수당|자가운전보조금|자가운전|교통보조/],
+    ['기타수당', /기타수당/],
+    ['상여금', /(^|[^가-힣])(상여금)([^가-힣]|$)|\s상여금/],
+    ['성과상여금', /성과상여금/],
+    ['스승의날상여금', /스승의날상여금/],
+    ['방학휴가비', /방학휴가비/],
+    ['명절휴가비', /명절휴가비/],
+    ['기본급(영양사)', /기본급\s*\(?영양사\)?|영양사급여/],
+    ['차량기사급여', /차량기사급여|기사급여/],
+  ];
+  // 산출기초 블록 안에 여러 항목명이 섞여 있으면, 실제 산식 금액 앞에 가장 가까운 항목명을 우선합니다.
+  const eqIdx = raw.lastIndexOf('=');
+  const searchArea = eqIdx >= 0 ? raw.slice(0, eqIdx) : raw;
+  let best = null;
+  for(const [name, re] of patterns){
+    const ms = [...searchArea.matchAll(new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g'))];
+    if(ms.length){
+      const pos = ms[ms.length-1].index ?? 0;
+      if(!best || pos > best.pos) best = {name, pos};
+    }
+  }
+  if(best) return best.name;
+  if(/상여금/.test(compact)) return '상여금';
+  return '';
+}
+
 function extractCalcItemNameFromLine(t){
   let s = text(t || '');
   s = s.replace(/\(본예산\)|\(보조금및지원금\)|\(수익자부담금\)|\(그밖의수입\)/g, ' ')
@@ -827,11 +866,15 @@ function extractCalcItemNameFromLine(t){
   let m = s.match(/^(.{1,80}?)(?=\s*(?:[\{\(][^=]{0,80}?[0-9,]+\s*원?|[0-9,]+\s*원?\s*\*))/);
   if(!m) return '';
   let name = cleanCalcNameCandidate(m[1]);
-  if(!name) return '';
+  const known = knownCalcNameFromBasis(t);
+  if(known && (!name || name.length > 24 || /명절|행사|방학|스승/.test(name))) return known;
+  if(!name) return known || '';
   return name;
 }
 function parseCalcLine(t){
-  const extractedName = extractCalcItemNameFromLine(t);
+  let extractedName = extractCalcItemNameFromLine(t);
+  const knownName = knownCalcNameFromBasis(t);
+  if(knownName && (!extractedName || /명절|행사|방학|스승/.test(extractedName))) extractedName = knownName;
   const compact = text(t || '').replace(/\s+/g,'').replace(/＝/g,'=').replace(/[{}]/g,'');
   let m = compact.match(/([0-9,]+)원\*([0-9,]+)명\*([0-9,]+)(?:월|개월|개?월)=([0-9,]+)$/);
   if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:toNum(m[3]), amount:toNum(m[4]), missing:[], name:extractedName};
@@ -846,8 +889,8 @@ function parseCalcLine(t){
 
   // 복합 괄호 산식: (원장500,000원+부원장200,000원+교사50,000원)*12월=9,000,000
   // 또는 원 단위 표기가 일부 빠진 상여금 산식도 금액과 항목명을 우선 잡습니다.
-  if(/=([0-9,]+)$/.test(compact)){
-    const amountMatch = compact.match(/=([0-9,]+)$/);
+  if(/=([0-9,]+)(?:원)?$/.test(compact)){
+    const amountMatch = compact.match(/=([0-9,]+)(?:원)?$/);
     const peopleMatches = [...compact.matchAll(/([0-9,]+)명/g)].map(m=>toNum(m[1])).filter(Boolean);
     const monthMatch = compact.match(/([0-9,]+)(?:월|개월|개?월)/);
     const unitMatch = compact.match(/([0-9,]+)원/);
@@ -920,6 +963,7 @@ function offMokMatchScore(x, category, expectedMok){
   let score = 0;
   if(/직원급여|급여/.test(cat)){
     if(/차량기사급여|기사급여|운전.*급여|급여.*기사/.test(label)) score += 100;
+    if(/영양사|기본급영양사|영양사급여/.test(label)) score += 100;
     if(/급여|인건비|보수/.test(label)) score += 35;
     if(/주유|유류|운영비|수리|보험|임차료/.test(label)) score -= 25;
   }
@@ -948,9 +992,10 @@ function findOffMokMatches(calcs, expectedMok, diff, category){
     if(!closeMoney(Math.abs(x.PDF금액), absDiff)) return false;
     const label = norm((x.항목 || '') + ' ' + (x.산출기초 || ''));
     if(isPay){
-      // 직원급여 차액이 통학차량이용비/통학차량임차료 등에 숨어 있는 경우도 잡습니다.
-      if(/직원급여/.test(categoryNorm) && /(통학차량|차량|임차료|운행|기사)/.test(label + mok)) return true;
-      return /(급여|인건비|보수)/.test(label);
+      // 직원급여 차액이 다른 목의 기본급/급여/인건비성 산출내역에 숨어 있는 경우를 잡습니다.
+      // 예: 그밖의인건비 > 기본급(영양사), 통학차량이용비 > 차량기사급여
+      if(/직원급여/.test(categoryNorm) && /(통학차량|차량|임차료|운행|기사|영양사|기본급|급여|인건비)/.test(label + mok)) return true;
+      return /(급여|기본급|인건비|보수|영양사)/.test(label);
     }
     if(isAllowance) return /(수당|상여|휴가비|식대|정액급식|자가운전|직급|직책|연구|관리업무)/.test(label);
     return true;
@@ -1861,4 +1906,267 @@ function render(report){
   let reviewHtml = '<h3 class="section-title">금액 검토</h3>' + table(['구분','항목','엑셀금액','PDF금액','검토결과'], (review.rows||[]).map(r=>({구분:r.구분, 항목:r.항목, 엑셀금액:fmt(r.엑셀금액), PDF금액:fmt(r.PDF금액), 검토결과:r.검토결과})));
   reviewHtml += '<h3 class="section-title">지적사항</h3>' + table(['번호','지적내용','근거'], review.issues || []);
   $('precheck').innerHTML = reviewHtml;
+}
+
+/* =========================
+   v53 general matching overrides
+   - 사례별 하드코딩보다 금액+목+항목명 토큰+수당 핵심키 기반으로 범용 매칭
+   ========================= */
+function stripBudgetPrefixes_v53(s){
+  return String(s||'')
+    .replace(/\(본예산\)|\(보조금및지원금\)|\(수익자부담금\)|\(그밖의수입\)/g,' ')
+    .replace(/\[[^\]]{1,8}\]/g,' ')
+    .replace(/\s+/g,' ')
+    .trim();
+}
+function normItem_v53(s){
+  return norm(stripBudgetPrefixes_v53(s)).replace(/^(교원|직원|교사|사무직원|조리직원|보조교사|방과후교원|방과후교사)/,'');
+}
+function amountFromFormulaText_v53(s){
+  const raw = String(s||'').replace(/＝/g,'=');
+  const matches = [...raw.matchAll(/=\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*(?:원)?/g)];
+  if(!matches.length) return 0;
+  return toNum(matches[matches.length-1][1]);
+}
+function firstFormulaEndIndex_v53(s){
+  const raw = String(s||'').replace(/＝/g,'=');
+  const m = raw.match(/=\s*(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*(?:원)?/);
+  return m ? (m.index + m[0].length) : -1;
+}
+function extractNameBeforeFormula_v53(s){
+  let raw = stripBudgetPrefixes_v53(s);
+  const eq = raw.search(/=\s*[0-9,]+/);
+  const left = eq>=0 ? raw.slice(0, eq) : raw;
+  const known = knownCalcNameFromBasis_v53(left || raw);
+  if(known) return known;
+  let m = left.match(/([가-힣A-Za-z0-9\[\]\(\)_]+(?:급여|기본급|수당|상여금|휴가비|급식비|식대|보조비|보조금|인건비|적립금|임차료|운영비|주유비|연료비|재료비|용역비|수수료|보험료|렌탈료|비품|공사비))\s*$/);
+  if(m) return cleanItemName(m[1]);
+  m = raw.match(/\)\s*([가-힣A-Za-z0-9\[\]\(\)_]{2,40})/);
+  return m ? cleanItemName(m[1]) : '';
+}
+function knownCalcNameFromBasis_v53(t){
+  const raw = stripBudgetPrefixes_v53(t || '');
+  const c = norm(raw);
+  const pairs = [
+    ['성과상여금', /성과\s*상여금|성과상여금/],
+    ['스승의날상여금', /스\s*승\s*의\s*날\s*상여금|스승의날상여금/],
+    ['명절휴가비', /명절\s*휴가비|명절휴가비/],
+    ['방학휴가비', /방학\s*휴가비|방학휴가비/],
+    ['정액급식비', /정액\s*급식비|급식수당|급식비|식대/],
+    ['근속수당', /근속\s*수당|근속수당/],
+    ['직책수당', /직책\s*수당|직책수당|직책급/],
+    ['직급보조비', /직급\s*보조비|직급수당|직급/],
+    ['연구수당', /연구\s*수당|연구활동비|연구비/],
+    ['연장수당', /연장\s*수당|연장근로|시간외/],
+    ['운전수당', /운전\s*수당|자가운전|교통보조/],
+    ['관리업무수당', /관리\s*업무\s*수당|관리업무수당/],
+    ['기타수당', /기타\s*수당|기타수당/],
+    ['상여금', /(^|[^가-힣])상여금|상여금/],
+    ['기본급', /기본급/],
+    ['급여', /급여/],
+    ['인건비', /인건비/]
+  ];
+  let best = null;
+  for(const [name,re] of pairs){
+    const ms = [...raw.matchAll(new RegExp(re.source, re.flags.includes('g')?re.flags:re.flags+'g'))];
+    if(ms.length){
+      const pos = ms[ms.length-1].index || 0;
+      if(!best || pos > best.pos) best = {name,pos};
+    }
+  }
+  if(best) return best.name;
+  if(/상여금/.test(c)) return '상여금';
+  return '';
+}
+function parseCalcLine(t){
+  const raw = String(t||'').replace(/＝/g,'=').replace(/\s+/g,' ').trim();
+  const amount = amountFromFormulaText_v53(raw);
+  if(!amount) return null;
+  const end = firstFormulaEndIndex_v53(raw);
+  const scope = end>=0 ? raw.slice(0,end) : raw;
+  const extractedName = extractNameBeforeFormula_v53(scope) || knownCalcNameFromBasis_v53(scope);
+  const compact = scope.replace(/\s+/g,'').replace(/[{}]/g,'');
+  const peopleMatches = [...compact.matchAll(/([0-9,]+)명/g)].map(m=>toNum(m[1])).filter(Boolean);
+  const monthMatch = compact.match(/([0-9,]+)(?:월|개월|개?월)/);
+  const unitMatch = compact.match(/([0-9,]+)원/);
+  const missing = [];
+  if(!peopleMatches.length && /(급여|수당|상여|휴가|식대|급식|보조|인건비)/.test(norm(extractedName + scope))) missing.push('인원 수');
+  if(!monthMatch && !/([0-9,]+)회/.test(compact) && /(급여|수당|식대|급식|보조|인건비)/.test(norm(extractedName + scope))) missing.push('월수');
+  return {
+    unit: unitMatch ? toNum(unitMatch[1]) : null,
+    people: peopleMatches.length ? Math.max(...peopleMatches) : null,
+    months: monthMatch ? toNum(monthMatch[1]) : null,
+    amount,
+    missing,
+    name: extractedName || '산출항목미상'
+  };
+}
+function collectCalcBlock(lines, startIdx){
+  const buf=[];
+  const startPage = lines[startIdx]?.page;
+  const maxEnd = Math.min(lines.length-1, startIdx + 28);
+  for(let k=startIdx;k<=maxEnd;k++){
+    const lt=lines[k];
+    if(!lt || lt.page !== startPage) break;
+    const s=text(lt.text||'');
+    if(!s) continue;
+    if(k>startIdx && parseTotalBudgetRow(s)) break;
+    // 새 (본예산) 블록이 시작되기 전에 현재 누적 블록이 이미 산식 금액을 포함하면 즉시 종료
+    const currentJoined = buf.join(' ').replace(/\s+/g,' ').trim();
+    if(k>startIdx && /\(본예산\)/.test(s) && amountFromFormulaText_v53(currentJoined)) break;
+    buf.push(s);
+    let joined=buf.join(' ').replace(/\s+/g,' ').trim();
+    const end = firstFormulaEndIndex_v53(joined);
+    if(end>=0){
+      const scoped = joined.slice(0,end);
+      const calc = parseCalcLine(scoped);
+      if(calc) return {start:startIdx, end:k, calc, basis:scoped};
+    }
+  }
+  const joined=buf.join(' ').replace(/\s+/g,' ').trim();
+  const calc=parseCalcLine(joined);
+  return calc ? {start:startIdx, end:startIdx, calc, basis:joined} : null;
+}
+function allowanceKey(s){
+  let k = norm(s);
+  if(!k) return '';
+  k = k.replace(/^(교원|직원|교사|사무직원|조리직원|보조교사|방과후교원|방과후교사)/,'');
+  k = k.replace(/^(방과후|방|급|운영|수|교)(?=(근속|급식|기본급|상여|연장|연구|직책|직급|운전|기타|식대|정액급식|관리업무|성과|스승|명절|방학))/, '');
+  if(/성과상여/.test(k)) return '성과상여';
+  if(/스승의날/.test(k)) return '스승의날상여';
+  if(/명절휴가|명절수당|명절상여/.test(k)) return '명절휴가';
+  if(/방학휴가|방학수당|방학상여/.test(k)) return '방학휴가';
+  if(/식대|급식비|정액급식|급식수당|급식보조/.test(k)) return '정액급식';
+  if(/근속/.test(k)) return '근속';
+  if(/연장근로|시간외|연장수당/.test(k)) return '시간외';
+  if(/연구활동|연구수당|연구비|연구/.test(k)) return '연구';
+  if(/교통보조|교통비|자가운전|자가차량|차량유지|운전수당/.test(k)) return '자가운전';
+  if(/직급보조|직급수당/.test(k)) return '직급';
+  if(/직책급|직책/.test(k)) return '직책급';
+  if(/관리업무/.test(k)) return '관리업무';
+  if(/^상여금?$/.test(k) || k === '상여') return '상여';
+  const stripped = k.replace(/수당|보조금|지원비|지원금|상여금|휴가비|급식비|식대|비/g,'');
+  return stripped || k;
+}
+function allowanceKeys(s){
+  const raw = String(s||'');
+  const base = allowanceKey(raw);
+  const keys = new Set(base ? [base] : []);
+  for(const part of raw.split(/[+/,·ㆍ\s]+/)){
+    const k = allowanceKey(part);
+    if(k) keys.add(k);
+  }
+  return [...keys].filter(Boolean);
+}
+function allowancePdfHit(kind, key, amount, x){
+  if(!x || !key || x.구분 !== '산출기초') return false;
+  if(LEGAL_RE.test(x.항목||'')) return false;
+  const mok = norm(x.목 || x.상위항목 || '');
+  const allowanceMok = kind === '교원' ? '교원수당' : '직원수당';
+  if(!(mok === allowanceMok || mok.includes(allowanceMok))) return false;
+  const labelText = `${x.항목 || ''} ${x.산출기초 || ''}`;
+  const labelKeys = allowanceKeys(labelText);
+  return labelKeys.some(k => sameAllowanceKeyForMatch(key,k));
+}
+function findAllowancePdfMatches(kind, allowanceName, amount, pdfItems){
+  const keys = allowanceKeys(allowanceName);
+  const candidates=[];
+  const seen = new Set();
+  for(const x of pdfItems || []){
+    if(x.구분 !== '산출기초') continue;
+    if(!keys.some(key=>allowancePdfHit(kind,key,amount,x))) continue;
+    const id=`${x.페이지}|${x.행}|${x.목}|${x.항목}|${x.PDF금액}`;
+    if(seen.has(id)) continue;
+    seen.add(id); candidates.push(x);
+  }
+  if(!candidates.length) return [];
+  const target = Number(amount||0);
+  const exact = candidates.filter(x=>closeMoney(Number(x.PDF금액||0), target));
+  if(exact.length) return exact;
+  // 같은 핵심 수당이 [방]/[급]/재원별로 분리된 경우 합산해서 일치하면 모두 인정합니다.
+  const smaller = candidates.filter(x=>Number(x.PDF금액||0) <= target + 1000);
+  const sum = smaller.reduce((s,x)=>s+Number(x.PDF금액||0),0);
+  if(closeMoney(sum,target)) return smaller;
+  return smaller.length ? smaller : candidates;
+}
+function tokenSet_v53(s){
+  const raw = norm(String(s||''));
+  const tokens = new Set();
+  const dict = ['교원','교사','원장','부원장','직원','사무','사무직원','조리','조리사','조리직원','보조교사','방과후','방과후보조','차량','기사','차량기사','영양사','행정','환경','미화','기본급','급여','봉급','인건비','수당','상여','상여금','성과','스승의날','명절','방학','근속','급식','정액급식','식대','직책','직급','연구','연장','시간외','운전','자가운전','관리업무'];
+  for(const d of dict) if(raw.includes(norm(d))) tokens.add(norm(d));
+  // 괄호 안 직종/항목도 토큰화
+  for(const m of String(s||'').matchAll(/[가-힣A-Za-z0-9]{2,}/g)){
+    const w = norm(m[0]);
+    if(w.length>=2) tokens.add(w);
+  }
+  return tokens;
+}
+function scoreByToken_v53(label, category, expectedMok){
+  const a = tokenSet_v53(label);
+  const b = tokenSet_v53(`${category||''} ${expectedMok||''}`);
+  let score = 0;
+  for(const t of a){
+    if(b.has(t)) score += 12;
+    for(const u of b){
+      if(t.length>=3 && u.length>=3 && (t.includes(u)||u.includes(t))) score += 4;
+    }
+  }
+  const l = norm(label), cat = norm(category||expectedMok||'');
+  if(/급여/.test(cat) && /(급여|기본급|인건비|보수|봉급)/.test(l)) score += 40;
+  if(/수당/.test(cat) && /(수당|상여|휴가|급식|식대|보조|연구|직급|직책|근속|운전)/.test(l)) score += 40;
+  if(/급여/.test(cat) && /(주유|유류|연료|수리|보험|공사|렌탈|소모품|재료비|운영비)/.test(l) && !/(급여|기본급|인건비|보수|봉급)/.test(l)) score -= 35;
+  return score;
+}
+function offMokMatchScore(x, category, expectedMok){
+  const label = `${cleanItemName(x?.항목 || '')} ${x?.산출기초 || ''} ${x?.목 || x?.상위항목 || ''}`;
+  return scoreByToken_v53(label, category, expectedMok);
+}
+function findOffMokMatches(calcs, expectedMok, diff, category){
+  const absDiff = Math.abs(Number(diff||0));
+  if(absDiff <= 1000) return [];
+  const target = norm(expectedMok);
+  const categoryNorm = norm(category || expectedMok || '');
+  const direct=[];
+  for(const x of calcs || []){
+    if(!x || !x.PDF금액 || x.구분 !== '산출기초') continue;
+    if(LEGAL_RE.test(x.항목 || '')) continue;
+    const mok = norm(x.목 || x.상위항목 || '');
+    if(!mok || mok.includes(target)) continue;
+    if(!closeMoney(Math.abs(Number(x.PDF금액||0)), absDiff)) continue;
+    const label = `${x.항목||''} ${x.산출기초||''} ${x.목||''}`;
+    const score = offMokMatchScore(x, category, expectedMok);
+    direct.push({...x, _score:score});
+  }
+  if(direct.length){
+    direct.sort((a,b)=> (b._score-a._score) || String(a.목||'').localeCompare(String(b.목||'')) );
+    return direct;
+  }
+  // 단일 항목이 아니라 같은 목 안의 여러 산출항목 합계가 차액과 일치하는 경우도 전 목에서 일반 탐색합니다.
+  const groups = new Map();
+  for(const x of calcs || []){
+    if(!x || !x.PDF금액 || x.구분 !== '산출기초') continue;
+    if(LEGAL_RE.test(x.항목 || '')) continue;
+    const mokText = String(x.목 || x.상위항목 || '');
+    const mok = norm(mokText);
+    if(!mok || mok.includes(target)) continue;
+    if(!groups.has(mok)) groups.set(mok,{목:mokText, amount:0, items:[], score:0});
+    const g = groups.get(mok);
+    g.amount += Number(x.PDF금액||0);
+    g.items.push(x);
+    g.score += Math.max(0, offMokMatchScore(x, category, expectedMok));
+  }
+  const groupMatches=[];
+  for(const g of groups.values()){
+    if(closeMoney(g.amount, absDiff)){
+      const best = [...g.items].sort((a,b)=>offMokMatchScore(b,category,expectedMok)-offMokMatchScore(a,category,expectedMok))[0] || g.items[0];
+      groupMatches.push({페이지:best?.페이지||'', 행:best?.행||'', 목:g.목, 항목:cleanItemName(best?.항목||category||expectedMok), PDF금액:g.amount, 산출기초:g.items.map(x=>x.산출기초).join(' / '), 구분:'산출기초합계', _score:g.score});
+    }
+  }
+  groupMatches.sort((a,b)=>b._score-a._score);
+  return groupMatches;
+}
+function cleanItemName(name){
+  let s = String(name || '').trim();
+  if(/^량/.test(s)) s = '차' + s;
+  return s.replace(/\s+/g,'');
 }
