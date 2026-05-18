@@ -481,6 +481,10 @@ function parseSalarySheet(sheetName, aoa){
 function detectSalaryHeader(aoa, maxRows, maxCols){
   const direct = detectSalaryHeaderDirect(aoa, maxRows, maxCols);
   if(direct.ok) return direct;
+  // v39: 일부 기관 파일은 브라우저 파서가 헤더 텍스트를 부분적으로 놓칩니다.
+  // 이때 소계(교원)/소계(직원) 행의 숫자 구조로 본봉·지급액계 열을 추론합니다.
+  const inferred = detectSalaryHeaderBySubtotalPattern(aoa, maxRows, maxCols);
+  if(inferred.ok) return inferred;
   let best = null;
   for(let r=0; r<maxRows; r++){
     const rowWindow = [];
@@ -521,6 +525,53 @@ function detectSalaryHeader(aoa, maxRows, maxCols){
   }
   return {ok:true, ...picked};
 }
+
+
+function detectSalaryHeaderBySubtotalPattern(aoa, maxRows, maxCols){
+  const teacherEnd = findRow(aoa, 0, /소계\s*\(?교원\)?|소계교원/);
+  const staffEnd = findRow(aoa, teacherEnd >= 0 ? teacherEnd + 1 : 0, /소계\s*\(?(직원|일반직)\)?|소계직원|소계일반직/);
+  if(teacherEnd < 0 && staffEnd < 0) return {ok:false};
+  const subtotalRow = aoa[teacherEnd >= 0 ? teacherEnd : staffEnd] || [];
+  // 직명/성명은 대부분 앞쪽 텍스트 열입니다. 그래도 텍스트 밀도가 가장 높은 앞쪽 열을 찾습니다.
+  let jobCol = -1, nameCol = -1;
+  for(let c=0; c<Math.min(8, maxCols); c++){
+    const top = columnText(aoa, c, Math.min(maxRows, 30));
+    const nt = norm(top);
+    if(jobCol < 0 && (/직명/.test(nt) || /원장|교사|조리|영양|보조|기사|직원/.test(top))) jobCol = c;
+    if(nameCol < 0 && (/성명/.test(nt) || /[가-힣]{2,4}/.test(top) andFalse())) nameCol = c;
+  }
+  if(jobCol < 0) jobCol = 1;
+  if(nameCol < 0) nameCol = jobCol + 1;
+
+  const nums = [];
+  for(let c=0; c<maxCols; c++){
+    const n = toNum(subtotalRow[c]);
+    if(n > 0) nums.push({c,n});
+  }
+  if(!nums.length) return {ok:false};
+  const firstMoney = nums.find(x => x.c > nameCol) || nums[0];
+  const baseCol = firstMoney.c;
+  let totalCol = -1, bestDiff = Infinity;
+  for(const cand of nums){
+    const c = cand.c;
+    if(c <= baseCol) continue;
+    let sum = 0;
+    for(let k=baseCol; k<c; k++) sum += toNum(subtotalRow[k]);
+    const diff = Math.abs(sum - cand.n);
+    // 지급액계는 보통 본봉~수당 합과 거의 같습니다.
+    if(sum > 0 && diff < bestDiff){ bestDiff = diff; totalCol = c; }
+  }
+  if(totalCol < 0){
+    // 합산관계가 안 잡히면 세금/공제 열 앞의 큰 금액 열을 우선 사용
+    const candidates = nums.filter(x=>x.c>baseCol).sort((a,b)=>b.n-a.n);
+    totalCol = candidates[0]?.c ?? -1;
+  }
+  if(totalCol <= baseCol) return {ok:false};
+  let headerRow = findHeaderRow(aoa, [jobCol, baseCol, totalCol]);
+  if(!Number.isFinite(headerRow) || headerRow < 0) headerRow = Math.max(0, Math.min(teacherEnd, staffEnd >= 0 ? staffEnd : teacherEnd) - 1);
+  return {ok:true, headerRow, jobCol, nameCol, baseCol, totalCol, score:88, inferred:true};
+}
+function andFalse(){ return false; }
 
 function detectSalaryHeaderDirect(aoa, maxRows, maxCols){
   // 보수표는 기관마다 병합/다중행 헤더가 달라도 보통 한 행 안에 직명·본봉·지급액계가 존재합니다.
