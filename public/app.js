@@ -39,37 +39,20 @@ function escapeHtml(s){return s.replace(/[&<>"]/g, m=>({'&':'&amp;','<':'&lt;','
 function setStatus(msg, ok=true){ const el=$('status'); el.className='status '+(ok?'ok':'err'); el.textContent=msg; }
 
 $('runBtn').addEventListener('click', async () => {
-  const btn = $('runBtn');
   try{
-    btn.disabled = true;
+    setStatus('파일을 읽는 중입니다...', true);
     const excelFile = $('excelFile').files[0];
     const pdfFile = $('pdfFile').files[0];
     if(!excelFile && !pdfFile) throw new Error('엑셀 또는 PDF 파일을 선택해주세요.');
-    const report = { createdAt:new Date().toISOString(), excel:null, pdf:null, precheck:[], progress:[] };
-    const step = async (msg) => {
-      report.progress.push({time:new Date().toISOString(), message:msg});
-      setStatus(msg, true);
-      await new Promise(r=>setTimeout(r, 20));
-    };
-    await step('1/4 파일 확인 완료');
-    if(excelFile){
-      await step('2/4 엑셀 시트와 보수/퇴직 자료를 읽는 중입니다...');
-      report.excel = await parseExcel(excelFile);
-      await step('2/4 엑셀 읽기 완료');
-    }
-    if(pdfFile){
-      await step('3/4 PDF 목/산출기초를 읽는 중입니다...');
-      report.pdf = await parsePdf(pdfFile);
-      await step('3/4 PDF 읽기 완료');
-    }
-    await step('4/4 1차 검토표를 만드는 중입니다...');
+    const report = { createdAt:new Date().toISOString(), excel:null, pdf:null, precheck:[] };
+    if(excelFile) report.excel = await parseExcel(excelFile);
+    if(pdfFile) report.pdf = await parsePdf(pdfFile);
     report.precheck = buildPrecheck(report);
     state.report = report;
     render(report);
     $('downloadBtn').disabled = false;
     setStatus('값 추출이 완료되었습니다. 아래 표에서 엑셀/PDF가 제대로 읽혔는지 확인해주세요.', true);
   }catch(e){ console.error(e); setStatus('오류가 발생했습니다: '+e.message, false); }
-  finally{ btn.disabled = false; }
 });
 $('downloadBtn').addEventListener('click', () => {
   const blob = new Blob([JSON.stringify(state.report,null,2)], {type:'application/json'});
@@ -498,10 +481,6 @@ function parseSalarySheet(sheetName, aoa){
 function detectSalaryHeader(aoa, maxRows, maxCols){
   const direct = detectSalaryHeaderDirect(aoa, maxRows, maxCols);
   if(direct.ok) return direct;
-  // v39: 일부 기관 파일은 브라우저 파서가 헤더 텍스트를 부분적으로 놓칩니다.
-  // 이때 소계(교원)/소계(직원) 행의 숫자 구조로 본봉·지급액계 열을 추론합니다.
-  const inferred = detectSalaryHeaderBySubtotalPattern(aoa, maxRows, maxCols);
-  if(inferred.ok) return inferred;
   let best = null;
   for(let r=0; r<maxRows; r++){
     const rowWindow = [];
@@ -542,53 +521,6 @@ function detectSalaryHeader(aoa, maxRows, maxCols){
   }
   return {ok:true, ...picked};
 }
-
-
-function detectSalaryHeaderBySubtotalPattern(aoa, maxRows, maxCols){
-  const teacherEnd = findRow(aoa, 0, /소계\s*\(?교원\)?|소계교원/);
-  const staffEnd = findRow(aoa, teacherEnd >= 0 ? teacherEnd + 1 : 0, /소계\s*\(?(직원|일반직)\)?|소계직원|소계일반직/);
-  if(teacherEnd < 0 && staffEnd < 0) return {ok:false};
-  const subtotalRow = aoa[teacherEnd >= 0 ? teacherEnd : staffEnd] || [];
-  // 직명/성명은 대부분 앞쪽 텍스트 열입니다. 그래도 텍스트 밀도가 가장 높은 앞쪽 열을 찾습니다.
-  let jobCol = -1, nameCol = -1;
-  for(let c=0; c<Math.min(8, maxCols); c++){
-    const top = columnText(aoa, c, Math.min(maxRows, 30));
-    const nt = norm(top);
-    if(jobCol < 0 && (/직명/.test(nt) || /원장|교사|조리|영양|보조|기사|직원/.test(top))) jobCol = c;
-    if(nameCol < 0 && (/성명/.test(nt) || /[가-힣]{2,4}/.test(top) andFalse())) nameCol = c;
-  }
-  if(jobCol < 0) jobCol = 1;
-  if(nameCol < 0) nameCol = jobCol + 1;
-
-  const nums = [];
-  for(let c=0; c<maxCols; c++){
-    const n = toNum(subtotalRow[c]);
-    if(n > 0) nums.push({c,n});
-  }
-  if(!nums.length) return {ok:false};
-  const firstMoney = nums.find(x => x.c > nameCol) || nums[0];
-  const baseCol = firstMoney.c;
-  let totalCol = -1, bestDiff = Infinity;
-  for(const cand of nums){
-    const c = cand.c;
-    if(c <= baseCol) continue;
-    let sum = 0;
-    for(let k=baseCol; k<c; k++) sum += toNum(subtotalRow[k]);
-    const diff = Math.abs(sum - cand.n);
-    // 지급액계는 보통 본봉~수당 합과 거의 같습니다.
-    if(sum > 0 && diff < bestDiff){ bestDiff = diff; totalCol = c; }
-  }
-  if(totalCol < 0){
-    // 합산관계가 안 잡히면 세금/공제 열 앞의 큰 금액 열을 우선 사용
-    const candidates = nums.filter(x=>x.c>baseCol).sort((a,b)=>b.n-a.n);
-    totalCol = candidates[0]?.c ?? -1;
-  }
-  if(totalCol <= baseCol) return {ok:false};
-  let headerRow = findHeaderRow(aoa, [jobCol, baseCol, totalCol]);
-  if(!Number.isFinite(headerRow) || headerRow < 0) headerRow = Math.max(0, Math.min(teacherEnd, staffEnd >= 0 ? staffEnd : teacherEnd) - 1);
-  return {ok:true, headerRow, jobCol, nameCol, baseCol, totalCol, score:88, inferred:true};
-}
-function andFalse(){ return false; }
 
 function detectSalaryHeaderDirect(aoa, maxRows, maxCols){
   // 보수표는 기관마다 병합/다중행 헤더가 달라도 보통 한 행 안에 직명·본봉·지급액계가 존재합니다.
@@ -688,81 +620,74 @@ function headerNameForCol(aoa, col, headerRow){
   return cleanHeader([...new Set(vals)].join(' '));
 }
 function parseRetireSheet(sheetName, aoa){
-  // v40: 퇴직 적립 여부는 퇴직 관련 시트 안의 `기적립현황` 구역에서
-  // `소계` 열에 실제 양수 금액이 있는지를 기준으로 판단합니다.
-  // 다른 구역의 합계/예상액/이월액/지급액은 퇴직 적립금액으로 보지 않습니다.
-  const preview = aoa.slice(0,40).map((r,i)=>({행:i+1, 내용:(r||[]).map(text).filter(Boolean).join(' | ').slice(0,240)})).filter(x=>x.내용);
-  const maxRows = Math.min(aoa.length, 250);
-  const maxCols = Math.max(0, ...aoa.slice(0, Math.min(maxRows, aoa.length)).map(r=>Math.min(r.length || 0, 120)));
-
-  const markerRows = [];
-  for(let r=0; r<maxRows; r++){
-    const rowText = (aoa[r]||[]).map(text).join(' ');
-    if(/기\s*적\s*립\s*현\s*황/.test(rowText) || /기적립현황/.test(norm(rowText))){
-      markerRows.push(r);
+  // v37: 퇴직 시트의 모든 숫자를 더하지 않고, 실제 `퇴직적립금` 열만 읽습니다.
+  // 적립인원/예금이자/소계/지급액/이월액/날짜/연도 숫자는 제외합니다.
+  const maxHeaderRows = Math.min(12, aoa.length);
+  const maxCols = Math.max(0, ...aoa.slice(0, Math.min(30, aoa.length)).map(r=>r.length || 0));
+  const retireCols = [];
+  for(let c=0; c<maxCols; c++){
+    const headerVals = [];
+    for(let r=0; r<maxHeaderRows; r++){
+      const v = text(aoa[r]?.[c]);
+      if(v) headerVals.push(v);
+    }
+    const h = headerVals.join(' ');
+    const hn = norm(h);
+    const isRetireAmountCol = /퇴직.*적립금|퇴직금.*적립금|퇴직적립금/.test(hn);
+    const excluded = /인원|예금|이자|소계|합계|계\s*\(|지급액|지급인원|이월|날짜|년월|월수|일수|요율|율/.test(h);
+    if(isRetireAmountCol && !excluded){
+      retireCols.push({col:c, header:h.slice(0,80)});
     }
   }
 
-  const positiveCells = [];
-  const retireColumns = [];
-
-  for(const marker of markerRows){
-    const headerStart = marker;
-    const headerEnd = Math.min(marker + 8, maxRows - 1);
-    const dataStart = headerEnd + 1;
-
-    // `기적립현황` 표 안의 소계 열 찾기. 병합/다중행 헤더를 고려해 마커행~8행 아래까지 열별 텍스트를 봅니다.
-    const subtotalCols = [];
-    for(let c=0; c<maxCols; c++){
-      const h = [];
-      for(let r=headerStart; r<=headerEnd; r++){
-        const v = text(aoa[r]?.[c]);
-        if(v) h.push(v);
-      }
-      const joined = h.join(' ');
-      const n = norm(joined);
-      if(/소계/.test(joined) || /소계/.test(n)){
-        // 지급현황/예상액/부담금 쪽 소계가 같이 있을 수 있어 기적립현황 마커 근처의 열을 우선 사용합니다.
-        subtotalCols.push({col:c, header:joined.slice(0,80)});
-      }
-    }
-
-    for(const sc of subtotalCols){
-      if(!retireColumns.some(x=>x.col===sc.col)) retireColumns.push(sc);
-      let blankRun = 0;
-      for(let r=dataStart; r<maxRows; r++){
-        const row = aoa[r] || [];
-        const rowText = row.map(text).join(' ');
-        if(/퇴직\s*예상|지급\s*현황|지급액|예상액|이월|예금\s*이자|비고/.test(rowText) && r > dataStart + 2) break;
-        if(!rowText){
-          blankRun++;
-          if(blankRun >= 4) break;
-          continue;
-        }
-        blankRun = 0;
-        const n = toNum(row[sc.col]);
-        if(n > 0){
-          positiveCells.push({행:r+1, 열:sc.col+1, 값:n, 헤더:sc.header, 구역:'기적립현황', 주변:rowText.slice(0,180)});
+  // 헤더가 병합되어 열 제목을 못 잡는 일부 서식 보정: 셀 자체가 `퇴직 적립금`인 열을 다시 확인
+  if(!retireCols.length){
+    for(let r=0; r<maxHeaderRows; r++){
+      for(let c=0; c<(aoa[r]?.length||0); c++){
+        const h = text(aoa[r][c]);
+        const hn = norm(h);
+        if(/퇴직.*적립금|퇴직적립금/.test(hn) && !/인원|이자|소계|합계|지급|이월/.test(h)){
+          retireCols.push({col:c, header:h.slice(0,80)});
         }
       }
     }
   }
 
-  // 소계 열에 합계행이 있으면 합계행만 사용해 상세행+합계행 중복 집계를 방지합니다.
-  const totalLike = positiveCells.filter(c=>/(^|\s)(계|합계|총계|소계)(\s|$)/.test(c.주변));
-  const usedCells = totalLike.length ? totalLike : positiveCells;
-  const positive = usedCells.reduce((s,c)=>s+Number(c.값||0),0);
+  const headerLastRow = (()=>{
+    let last = 0;
+    for(let r=0; r<maxHeaderRows; r++){
+      const joined = aoa[r]?.map(text).join(' ') || '';
+      if(/퇴\s*직|적\s*립|구분|직종/.test(joined)) last = r;
+    }
+    return last;
+  })();
 
+  const dataCells = [];
+  const totalCells = [];
+  for(let r=headerLastRow+1; r<aoa.length; r++){
+    const row = aoa[r] || [];
+    const rowText = row.map(text).join(' ');
+    if(/연도|년월|날짜/.test(rowText)) continue;
+    const isTotal = /(^|\s)(계|합계|총계)(\s|$)/.test(text(row[0] || rowText));
+    for(const rc of retireCols){
+      const n = toNum(row[rc.col]);
+      if(n > 0){
+        const cell = {행:r+1, 열:rc.col+1, 값:n, 헤더:rc.header, 주변:rowText.slice(0,160)};
+        if(isTotal) totalCells.push(cell); else dataCells.push(cell);
+      }
+    }
+  }
+
+  // 합계행이 있으면 합계행을 우선 사용해 상세행+합계행 이중 집계를 방지합니다.
+  const usedCells = totalCells.length ? totalCells : dataCells;
+  const positive = usedCells.reduce((s,c)=>s+c.값,0);
   return {
     sheetName,
     positiveAmount:positive,
     hasRetirementAmount:positive>0,
-    criterion:'기적립현황 소계 열의 양수 금액',
-    markerRows:markerRows.map(r=>r+1),
-    retireColumns:retireColumns.map(c=>({열:c.col+1, 헤더:c.header})),
+    retireColumns:retireCols.map(c=>({열:c.col+1, 헤더:c.header})),
     positiveCells:usedCells.slice(0,30),
-    ignoredPositiveCells:totalLike.length ? positiveCells.filter(c=>!totalLike.includes(c)).slice(0,10) : [],
-    preview
+    ignoredPositiveCells:dataCells.length && totalCells.length ? dataCells.slice(0,10) : []
   };
 }
 
