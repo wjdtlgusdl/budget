@@ -723,7 +723,7 @@ function extractBudgetItems(lines){
     const calc = parseCalcLine(t);
     if(calc){
       const name = findCalcName(lines, i) || currentTotal?.항목 || '산출항목미상';
-      out.push({페이지:l.page, 행:i+1, 목:currentTotal?.항목 || '', 상위항목:currentTotal?.항목 || '', 항목:name, PDF금액:calc.amount, PDF금액천원:Math.round(calc.amount/1000), 인원:calc.people, 산출기초:t, 구분:'산출기초'});
+      out.push({페이지:l.page, 행:i+1, 목:currentTotal?.항목 || '', 상위항목:currentTotal?.항목 || '', 항목:name, PDF금액:calc.amount, PDF금액천원:Math.round(calc.amount/1000), 인원:calc.people, 누락항목:calc.missing || [], 산출기초:t, 구분:'산출기초'});
     }
   }
   return out.filter(x=>!LEGAL_RE.test(x.항목));
@@ -762,14 +762,59 @@ function validBudgetRowName(name){
   return true;
 }
 function parseCalcLine(t){
-  const compact = t.replace(/\s+/g,'');
-  let m = compact.match(/([0-9,]+)원\*([0-9,]+)명\*([0-9,]+)월=([0-9,]+)$/);
-  if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:toNum(m[3]), amount:toNum(m[4])};
-  m = compact.match(/([0-9,]+)원\*([0-9,]+)월=([0-9,]+)$/);
-  if(m) return {unit:toNum(m[1]), people:null, months:toNum(m[2]), amount:toNum(m[3])};
-  m = compact.match(/([0-9,]+)원\*([0-9,]+)명\*1월=([0-9,]+)$/);
-  if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:1, amount:toNum(m[3])};
+  const compact = t.replace(/\s+/g,'').replace(/＝/g,'=');
+  let m = compact.match(/([0-9,]+)원\*([0-9,]+)명\*([0-9,]+)(?:월|개월|개?월)=([0-9,]+)$/);
+  if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:toNum(m[3]), amount:toNum(m[4]), missing:[]};
+
+  // 인원 수가 빠진 형태: 3,600,000원*12월=43,200,000
+  m = compact.match(/([0-9,]+)원\*([0-9,]+)(?:월|개월|개?월)=([0-9,]+)$/);
+  if(m) return {unit:toNum(m[1]), people:null, months:toNum(m[2]), amount:toNum(m[3]), missing:['인원 수']};
+
+  // 월수/개월 수가 빠진 형태: 100,000원*5명=500,000
+  m = compact.match(/([0-9,]+)원\*([0-9,]+)명=([0-9,]+)$/);
+  if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:null, amount:toNum(m[3]), missing:['월수']};
+
+  // 산출식은 있으나 인원/월수 구조가 불완전한 형태도 금액은 잡아 둡니다.
+  if(/원/.test(compact) && /=/.test(compact)){
+    const amountMatch = compact.match(/=([0-9,]+)$/);
+    if(amountMatch){
+      const peopleMatch = compact.match(/([0-9,]+)명/);
+      const monthMatch = compact.match(/([0-9,]+)(?:월|개월|개?월)/);
+      const unitMatch = compact.match(/([0-9,]+)원/);
+      const missing = [];
+      if(!peopleMatch) missing.push('인원 수');
+      if(!monthMatch) missing.push('월수');
+      return {
+        unit: unitMatch ? toNum(unitMatch[1]) : null,
+        people: peopleMatch ? toNum(peopleMatch[1]) : null,
+        months: monthMatch ? toNum(monthMatch[1]) : null,
+        amount: toNum(amountMatch[1]),
+        missing
+      };
+    }
+  }
   return null;
+}
+
+function isLaborBasisTarget(x){
+  const s = norm((x?.목 || '') + ' ' + (x?.항목 || '') + ' ' + (x?.산출기초 || ''));
+  if(LEGAL_RE.test(s)) return false;
+  return /(교원급여|교원수당|직원급여|직원수당|그밖의인건비|인건비|급여|수당|상여|휴가비|정액급식|급식보조|보조비|처우개선|연구|직급|직책|자가운전)/.test(s);
+}
+function addBasisIssues(issues, calcs){
+  const seen = new Set();
+  for(const x of calcs || []){
+    if(!isLaborBasisTarget(x)) continue;
+    const missing = Array.isArray(x.누락항목) ? x.누락항목 : (Array.isArray(x.missing) ? x.missing : []);
+    if(!missing.length) continue;
+    const item = cleanItemName(x.항목 || x.목 || '해당 항목');
+    const msg = `${item} 산출기초에 ${missing.join(', ')} 미표시`;
+    const basis = `PDF ${x.페이지 || ''}쪽 ${x.목 ? `목 ${x.목}, ` : ''}산출기초: ${x.산출기초 || ''}`;
+    const key = msg + '|' + basis;
+    if(seen.has(key)) continue;
+    seen.add(key);
+    issues.push({번호:issues.length+1, 지적내용:msg, 근거:basis});
+  }
 }
 function cleanCalcNameCandidate(raw){
   let s = text(raw || '');
@@ -889,11 +934,7 @@ function detailVerdict(label, excelAmount, pdfAmount, excelPeople, pdfPeople, of
       parts.push(`금액 차이(엑셀 ${fmt(ea)} / PDF ${fmt(pa)} / 차이 ${fmt(Math.abs(diff))})`);
     }
   }
-  if(pdfPeople !== '' && pdfPeople !== null && pdfPeople !== undefined && ep !== pp){
-    const d=ep-pp;
-    const dir=d>0 ? '부족' : '초과';
-    parts.push(`인원 차이(엑셀 ${ep}명 / PDF ${pp}명, ${label.replace(/급여|수당/g,'')} ${Math.abs(d)}명 ${dir})`);
-  }
+  // v41: 인원 차이는 검토 대상에서 제외합니다.
   return parts.length ? parts.join(' / ') : '일치';
 }
 function totalRowByName(totals, name){ return totals.find(x=>norm(x.항목)===norm(name)); }
@@ -1014,6 +1055,9 @@ function buildPrecheck(report){
   const totalByName = (name) => totalRowByName(totals, name)?.PDF금액 || 0;
   const amountByCalc = (re) => calcs.filter(x=>re.test(x.항목)).reduce((s,x)=>s+x.PDF금액,0);
   const addIssue = (지적내용, 근거) => issues.push({번호:issues.length+1, 지적내용, 근거});
+
+  // 인건비 산출기초가 '단가*인원*월수' 구조를 갖추지 못한 경우를 지적합니다.
+  addBasisIssues(issues, calcs);
 
   if(ex){
     const teacherBase = ex.교원.소계본봉 || ex.교원.본봉;
@@ -1245,12 +1289,12 @@ function render(report){
   if(report.pdf){
     const pdf=report.pdf;
     $('pdfSummary').innerHTML = `<span class="pill">파일 ${escapeHtml(pdf.fileName)}</span><span class="pill">${pdf.pageCount}페이지</span><span class="pill">항목 ${pdf.items.length}개</span>`;
-    let html = '<h3 class="section-title">PDF 추출 항목</h3>'+table(['구분','페이지','목','항목','PDF금액','PDF금액천원','인원','산출기초'], pdf.items.map(x=>({...x,PDF금액:fmt(x.PDF금액)})));
+    let html = '<h3 class="section-title">PDF 추출 항목</h3>'+table(['구분','페이지','목','항목','PDF금액','PDF금액천원','누락항목','산출기초'], pdf.items.map(x=>({...x,PDF금액:fmt(x.PDF금액),누락항목:(x.누락항목||[]).join(', ')})));
     html += '<h3 class="section-title">PDF 원문 라인</h3>'+table(['페이지','y','텍스트'], pdf.lines.slice(0,300), {small:true});
     $('pdfTables').innerHTML = html;
   }
   const review = report.precheck || {rows:[], issues:[]};
-  let reviewHtml = '<h3 class="section-title">금액 및 인원 검토</h3>' + table(['구분','항목','엑셀금액','엑셀인원','PDF금액','PDF인원','검토결과'], review.rows.map(r=>({...r,엑셀금액:fmt(r.엑셀금액),PDF금액:fmt(r.PDF금액)})));
+  let reviewHtml = '<h3 class="section-title">금액 검토</h3>' + table(['구분','항목','엑셀금액','PDF금액','검토결과'], review.rows.map(r=>({구분:r.구분, 항목:r.항목, 엑셀금액:fmt(r.엑셀금액), PDF금액:fmt(r.PDF금액), 검토결과:r.검토결과})));
   reviewHtml += '<h3 class="section-title">지적사항</h3>' + table(['번호','지적내용','근거'], review.issues || []);
   $('precheck').innerHTML = reviewHtml;
 }
