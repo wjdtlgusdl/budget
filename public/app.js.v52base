@@ -738,10 +738,7 @@ function extractBudgetItems(lines){
 
     const block = collectCalcBlock(lines, i);
     if(block && block.calc){
-      let name = block.calc.name || '';
-      const nearName = findCalcName(lines, i) || findCalcName(lines, block.end) || '';
-      if(!name || name === currentTotal?.항목 || name === '산출항목미상' || name.length < 2 || /^[가-힣]$/.test(name)) name = nearName;
-      if(!name) name = currentTotal?.항목 || '산출항목미상';
+      const name = block.calc.name || findCalcName(lines, i) || currentTotal?.항목 || '산출항목미상';
       out.push({페이지:l.page, 행:i+1, 목:currentTotal?.항목 || '', 상위항목:currentTotal?.항목 || '', 항목:name, PDF금액:block.calc.amount, PDF금액천원:Math.round(block.calc.amount/1000), 인원:block.calc.people, 누락항목:block.calc.missing || [], 산출기초:block.basis, 구분:'산출기초'});
       i = block.end;
     }
@@ -824,21 +821,20 @@ function knownCalcNameFromBasis(t){
   const compact = norm(raw);
   const patterns = [
     ['[방]근속수당', /\[방\]\s*근속수당|방근속수당/],
-    ['근속수당', /(?<!방)근속수당|(^|[^가-힣])근속수당/],
+    ['근속수당', /(?<!방)근속수당/],
     ['[방]급식수당', /\[방\]\s*급식수당|방급식수당/],
-    ['급식수당', /(?<!방)급식수당|정액\s*급식비|급식비\(교원\)|교원정액급식비|직원정액급식비/],
+    ['급식수당', /(?<!방)급식수당|정액급식비|교원정액급식비|직원정액급식비/],
     ['직책수당', /직책수당|직책급업무추진비/],
-    // PDF가 "직 150,000원... 급보조비"처럼 산출내역 첫 글자를 산식 앞에 떼어내는 경우 보정
-    ['직급보조비', /직급보조비|직급수당|급보조비/],
-    ['연구수당', /연구수당|연구활동비|연구비|구수당\(교원\)|구수당/],
-    ['연장수당', /연장수당|연장근로수당|시간외수당|장근로수당/],
-    ['운전수당', /운전수당|자가운전보조금|자가운전|교통보조|통보조비/],
+    ['직급보조비', /직급보조비|직급수당/],
+    ['연구수당', /연구수당|연구활동비|연구비/],
+    ['연장수당', /연장수당|연장근로수당|시간외수당/],
+    ['운전수당', /운전수당|자가운전보조금|자가운전|교통보조/],
     ['기타수당', /기타수당/],
+    ['상여금', /(^|[^가-힣])(상여금)([^가-힣]|$)|\s상여금/],
     ['성과상여금', /성과상여금/],
     ['스승의날상여금', /스승의날상여금/],
     ['방학휴가비', /방학휴가비/],
-    ['명절휴가비', /명절휴가비|절휴가비/],
-    ['상여금', /(^|[^가-힣])(상여금)([^가-힣]|$)|\s상여금|상여금/],
+    ['명절휴가비', /명절휴가비/],
     ['기본급(영양사)', /기본급\s*\(?영양사\)?|영양사급여/],
     ['차량기사급여', /차량기사급여|기사급여/],
   ];
@@ -893,9 +889,8 @@ function parseCalcLine(t){
 
   // 복합 괄호 산식: (원장500,000원+부원장200,000원+교사50,000원)*12월=9,000,000
   // 또는 원 단위 표기가 일부 빠진 상여금 산식도 금액과 항목명을 우선 잡습니다.
-  // 생각키움 PDF처럼 '= 급보조비(교원) 7,200,000' 형태로 산출내역명이 등호 뒤에 끼는 경우도 허용합니다.
-  if(/=[^0-9]{0,80}([0-9,]+)(?:원)?$/.test(compact)){
-    const amountMatch = compact.match(/=[^0-9]{0,80}([0-9,]+)(?:원)?$/);
+  if(/=([0-9,]+)(?:원)?$/.test(compact)){
+    const amountMatch = compact.match(/=([0-9,]+)(?:원)?$/);
     const peopleMatches = [...compact.matchAll(/([0-9,]+)명/g)].map(m=>toNum(m[1])).filter(Boolean);
     const monthMatch = compact.match(/([0-9,]+)(?:월|개월|개?월)/);
     const unitMatch = compact.match(/([0-9,]+)원/);
@@ -1190,28 +1185,6 @@ function findAllowancePdfMatches(kind, allowanceName, amount, pdfItems){
     if(seen.has(id)) continue;
     seen.add(id); matches.push(x);
   }
-
-  // 보정: [방]근속수당처럼 같은 목 안에 같은 핵심수당이 분할 편성된 경우,
-  // 첫 매칭 후 종료하지 않고 같은 key의 산출내역을 추가로 합산합니다.
-  // 단, PDF 전체 탐색으로 번지지 않도록 교원수당/직원수당 목 내부만 허용합니다.
-  const allowanceMok = kind === '교원' ? '교원수당' : '직원수당';
-  const currentSum = matches.reduce((s,x)=>s+Number(x.PDF금액||0),0);
-  if(keys.length && amount && currentSum && !closeMoney(currentSum, amount)){
-    for(const x of pdfItems){
-      if(x.구분 !== '산출기초') continue;
-      const mok = norm(x.목 || x.상위항목 || '');
-      if(!(mok === allowanceMok || mok.includes(allowanceMok))) continue;
-      const id = `${x.페이지}|${x.행}|${x.목}|${x.항목}|${x.PDF금액}`;
-      if(seen.has(id)) continue;
-      const xKeys = allowanceKeys(`${x.항목 || ''} ${x.산출기초 || ''}`);
-      if(!keys.some(k => xKeys.some(xk => sameAllowanceKeyForMatch(k, xk)))) continue;
-      const projected = matches.reduce((s,m)=>s+Number(m.PDF금액||0),0) + Number(x.PDF금액||0);
-      if(projected <= Number(amount||0) + 1000 || closeMoney(projected, amount)){
-        seen.add(id); matches.push(x);
-        if(closeMoney(projected, amount)) break;
-      }
-    }
-  }
   return matches;
 }
 function integratedText(kind, list, amountField, groupLabel, groupAmount){
@@ -1419,7 +1392,7 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupRowOrTotal){
   // 총액에서 이미 개별확인된 금액을 뺀 잔액만 사용합니다.
   // 예: 직원수당 목 총액 37,600,000원을 통합수당으로 보지 않고, 산출내역 '직원수당' 6,600,000원만 사용.
   const candidates = allowanceIntegratedCalcCandidates(kind, pdfItems);
-  if(residual) candidates.unshift({label:`${kind}수당 통합편성금액`, amount:residual});
+  if(residual) candidates.unshift({label:`${kind}수당 잔액`, amount:residual});
   // 산출내역 후보가 전혀 없는 예외 파일에서만 재원별 금액을 보조 후보로 사용하되, 목 전체 총액은 제외합니다.
   if(!candidates.length){
     for(const c of allowanceGroupCandidates(groupRow, kind).filter(c=>!closeMoney(c.amount, groupTotal))){
