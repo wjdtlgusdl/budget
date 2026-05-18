@@ -450,10 +450,24 @@ function sheetScore(name){
   if(/비월정|간이세액|세출|세입|퇴직|보험|명시이월|사고이월/.test(name)) score -= 120;
   return Math.max(0, score);
 }
+function effectiveMaxCols(aoa, maxRows=100){
+  // 일부 한컴/HCell XLSX는 실제 데이터가 A~T까지만 있어도 !ref가 A1:XFB41처럼 저장됩니다.
+  // 이 범위를 그대로 돌면 헤더 탐색이 느려지거나 빈 열에 밀려 실패하므로 실제 값이 있는 마지막 열까지만 사용합니다.
+  let last = 0;
+  for(let r=0; r<Math.min(maxRows, aoa.length); r++){
+    const row = aoa[r] || [];
+    const limit = Math.min(row.length || 0, 300);
+    for(let c=0; c<limit; c++){
+      if(text(row[c])) last = Math.max(last, c);
+    }
+  }
+  return Math.min(Math.max(last + 6, 25), 120);
+}
+
 function parseSalarySheet(sheetName, aoa){
   const preview = aoa.slice(0,60).map((r,i)=>({행:i+1, 내용:r.map(text).filter(Boolean).join(' | ').slice(0,300)})).filter(x=>x.내용);
   if(!aoa.length) return {ok:false, sheetName, message:'빈 시트', preview};
-  const maxRows = Math.min(100, aoa.length), maxCols = Math.max(...aoa.slice(0,maxRows).map(r=>r.length),0);
+  const maxRows = Math.min(100, aoa.length), maxCols = effectiveMaxCols(aoa, maxRows);
   const detected = detectSalaryHeader(aoa, maxRows, maxCols);
   if(!detected.ok){
     return {ok:false, sheetName, message:detected.message, preview};
@@ -620,74 +634,73 @@ function headerNameForCol(aoa, col, headerRow){
   return cleanHeader([...new Set(vals)].join(' '));
 }
 function parseRetireSheet(sheetName, aoa){
-  // v37: 퇴직 시트의 모든 숫자를 더하지 않고, 실제 `퇴직적립금` 열만 읽습니다.
-  // 적립인원/예금이자/소계/지급액/이월액/날짜/연도 숫자는 제외합니다.
-  const maxHeaderRows = Math.min(12, aoa.length);
-  const maxCols = Math.max(0, ...aoa.slice(0, Math.min(30, aoa.length)).map(r=>r.length || 0));
-  const retireCols = [];
-  for(let c=0; c<maxCols; c++){
-    const headerVals = [];
-    for(let r=0; r<maxHeaderRows; r++){
+  // v42: 퇴직 적립 여부는 `적립금이월액` 구역의 `계` 행 금액을 기준으로 판단합니다.
+  // 금액 일치 여부는 보지 않고, 이 값이 양수인지 여부만 이후 PDF 편성 여부와 비교합니다.
+  const maxRows = Math.min(80, aoa.length);
+  const maxCols = effectiveMaxCols(aoa, maxRows);
+  const cells = [];
+  for(let r=0; r<maxRows; r++){
+    for(let c=0; c<maxCols; c++){
       const v = text(aoa[r]?.[c]);
-      if(v) headerVals.push(v);
-    }
-    const h = headerVals.join(' ');
-    const hn = norm(h);
-    const isRetireAmountCol = /퇴직.*적립금|퇴직금.*적립금|퇴직적립금/.test(hn);
-    const excluded = /인원|예금|이자|소계|합계|계\s*\(|지급액|지급인원|이월|날짜|년월|월수|일수|요율|율/.test(h);
-    if(isRetireAmountCol && !excluded){
-      retireCols.push({col:c, header:h.slice(0,80)});
+      if(v) cells.push({r,c,v,n:norm(v)});
     }
   }
 
-  // 헤더가 병합되어 열 제목을 못 잡는 일부 서식 보정: 셀 자체가 `퇴직 적립금`인 열을 다시 확인
-  if(!retireCols.length){
-    for(let r=0; r<maxHeaderRows; r++){
-      for(let c=0; c<(aoa[r]?.length||0); c++){
-        const h = text(aoa[r][c]);
-        const hn = norm(h);
-        if(/퇴직.*적립금|퇴직적립금/.test(hn) && !/인원|이자|소계|합계|지급|이월/.test(h)){
-          retireCols.push({col:c, header:h.slice(0,80)});
+  // 1) `적립금이월액` 헤더가 병합되어 있으면 그 아래/주변 열 중 `계` 행의 금액을 읽습니다.
+  const carryHeaders = cells.filter(x => /적립금.*이월액|이월.*적립금|적립금이월액/.test(x.n));
+  const totalRows = cells.filter(x => /^(계|합계|총계)$/.test(x.n));
+  const picked = [];
+  for(const h of carryHeaders){
+    // 병합 헤더는 보통 해당 구역의 왼쪽 끝 셀에만 값이 있고, 실제 금액은 오른쪽 0~4열에 있습니다.
+    const cStart = h.c;
+    const cEnd = Math.min(maxCols - 1, h.c + 5);
+    for(const tr of totalRows){
+      if(tr.r <= h.r) continue;
+      const row = aoa[tr.r] || [];
+      for(let c=cStart; c<=cEnd; c++){
+        const n = toNum(row[c]);
+        if(n > 0){
+          picked.push({행:tr.r+1, 열:c+1, 값:n, 헤더:h.v, 주변:(row.map(text).filter(Boolean).join(' ')).slice(0,180)});
         }
       }
     }
   }
 
-  const headerLastRow = (()=>{
-    let last = 0;
-    for(let r=0; r<maxHeaderRows; r++){
-      const joined = aoa[r]?.map(text).join(' ') || '';
-      if(/퇴\s*직|적\s*립|구분|직종/.test(joined)) last = r;
-    }
-    return last;
-  })();
-
-  const dataCells = [];
-  const totalCells = [];
-  for(let r=headerLastRow+1; r<aoa.length; r++){
-    const row = aoa[r] || [];
-    const rowText = row.map(text).join(' ');
-    if(/연도|년월|날짜/.test(rowText)) continue;
-    const isTotal = /(^|\s)(계|합계|총계)(\s|$)/.test(text(row[0] || rowText));
-    for(const rc of retireCols){
-      const n = toNum(row[rc.col]);
-      if(n > 0){
-        const cell = {행:r+1, 열:rc.col+1, 값:n, 헤더:rc.header, 주변:rowText.slice(0,160)};
-        if(isTotal) totalCells.push(cell); else dataCells.push(cell);
+  // 2) 어떤 서식은 `적립금이월액` 텍스트가 공유문자열/병합셀 때문에 복원되지 않을 수 있습니다.
+  // 이 경우에는 퇴직금적립현황 표에서 `계` 행의 가장 오른쪽 양수 금액을 보조 기준으로 사용합니다.
+  // 단, `퇴직` 관련 시트에서만 이 함수가 호출되므로 급여표 숫자와 혼동하지 않습니다.
+  if(!picked.length){
+    for(const tr of totalRows){
+      const row = aoa[tr.r] || [];
+      const nums = [];
+      for(let c=0; c<Math.min(row.length, maxCols); c++){
+        const n = toNum(row[c]);
+        if(n > 0) nums.push({행:tr.r+1, 열:c+1, 값:n, 헤더:'계 행 우측 금액', 주변:(row.map(text).filter(Boolean).join(' ')).slice(0,180)});
+      }
+      if(nums.length){
+        picked.push(nums[nums.length-1]);
+        break;
       }
     }
   }
 
-  // 합계행이 있으면 합계행을 우선 사용해 상세행+합계행 이중 집계를 방지합니다.
-  const usedCells = totalCells.length ? totalCells : dataCells;
-  const positive = usedCells.reduce((s,c)=>s+c.값,0);
+  // 같은 행/열 중복 제거 후, `계` 기준은 하나의 대표값만 사용합니다.
+  const unique = [];
+  const seen = new Set();
+  for(const c of picked){
+    const key = `${c.행}:${c.열}:${c.값}`;
+    if(!seen.has(key)){ seen.add(key); unique.push(c); }
+  }
+  const representative = unique.length ? unique[0] : null;
+  const positive = representative ? Number(representative.값 || 0) : 0;
   return {
     sheetName,
-    positiveAmount:positive,
-    hasRetirementAmount:positive>0,
-    retireColumns:retireCols.map(c=>({열:c.col+1, 헤더:c.header})),
-    positiveCells:usedCells.slice(0,30),
-    ignoredPositiveCells:dataCells.length && totalCells.length ? dataCells.slice(0,10) : []
+    positiveAmount: positive,
+    hasRetirementAmount: positive > 0,
+    retireColumns: carryHeaders.map(h=>({열:h.c+1, 헤더:h.v})),
+    positiveCells: representative ? [representative] : [],
+    ignoredPositiveCells: unique.slice(1,10),
+    기준:'적립금이월액의 계'
   };
 }
 
