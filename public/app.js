@@ -860,14 +860,18 @@ function cleanCalcNameCandidate(raw){
   return cleaned;
 }
 function findCalcName(lines, idx){
-  // PDF 텍스트 추출에서는 산출항목명이 산출기초의 바로 위에 오기도 하고,
-  // 바로 아래에 오기도 합니다. 한쪽 방향만 보면 직원방학휴가비처럼
-  // 다른 항목명과 잘못 매칭되는 문제가 있어 가까운 양방향 후보를 봅니다.
-  const offsets = [1,-1,2,-2,3,-3,4,-4,5,-5,6,-6];
+  // 산출항목명은 대부분 산출기초 바로 위에 있습니다.
+  // 예: "근속수당" 다음 줄에 "{(20,000원*2명)+...}=960,000" 형태.
+  // 이전 버전은 아래쪽 후보를 먼저 보아 다음 항목명([방]근속수당 등)과 잘못 매칭되는 경우가 있었습니다.
+  const offsets = [-1,-2,-3,-4,-5,-6,1,2,3,4,5,6];
   for(const off of offsets){
     const j = idx + off;
     if(j < 0 || j >= lines.length) continue;
-    const cand = cleanCalcNameCandidate(lines[j]?.text || '');
+    const raw = lines[j]?.text || '';
+    // 총액행 또는 산출기초식이 들어 있는 줄은 항목명 후보에서 제외합니다.
+    if(parseTotalBudgetRow(raw)) continue;
+    if(/[0-9,]+\s*원|=\s*[0-9,]+/.test(text(raw))) continue;
+    const cand = cleanCalcNameCandidate(raw);
     if(cand) return cand;
   }
   return '';
@@ -1275,17 +1279,22 @@ function allowanceKey(s){
   k = k.replace(/^(?:\[[^\]]+\])+/g, '');
   // 소속/직종 접두어는 같은 항목 매칭에서 제외합니다.
   k = k.replace(/^(교원|직원|교사|사무직원|조리직원|보조교사)/,'');
+  // 접두어 제거 뒤에 다시 태그가 오는 경우도 보정합니다. 예: 교원[방]근속수당
+  k = k.replace(/^(?:\[[^\]]+\])+/g, '');
 
   // 기관마다 다른 명칭을 같은 수당으로 봅니다.
   if(/^(식대|급식비|정액급식비|정액급식|급식수당)$/.test(k) || /정액급식/.test(k)) return '정액급식';
   if(/성과상여/.test(k)) return '성과상여';
+  if(/^상여금?$/.test(k) || /상여/.test(k)) return '상여';
   if(/명절휴가/.test(k)) return '명절휴가';
   if(/스승의날/.test(k)) return '스승의날상여';
   if(/방학휴가/.test(k)) return '방학휴가';
   if(/자가운전|자가차량|차량유지/.test(k)) return '자가운전';
   if(/직책급|직책/.test(k)) return '직책급';
 
-  return k.replace(/수당|보조금|지원비|지원금|상여금|휴가비|급식비|식대|비/g,'');
+  const stripped = k.replace(/수당|보조금|지원비|지원금|휴가비|급식비|식대|비/g,'');
+  // 전부 지워져 빈 키가 되면 원 명칭을 보수적으로 유지합니다.
+  return stripped || k;
 }
 
 function render(report){
