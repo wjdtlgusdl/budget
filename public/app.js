@@ -733,13 +733,54 @@ function extractBudgetItems(lines){
       out.push({페이지:l.page, 행:i+1, 목:totalRow.항목, 상위항목:'', 항목:totalRow.항목, PDF금액:totalRow.금액, PDF금액천원:Math.round(totalRow.금액/1000), 보조금금액:totalRow.보조금, 수익자금액:totalRow.수익자, 기타금액:totalRow.기타, 인원:null, 산출기초:'', 구분:'총액행'});
       continue;
     }
-    const calc = parseCalcLine(t);
-    if(calc){
-      const name = calc.name || findCalcName(lines, i) || currentTotal?.항목 || '산출항목미상';
-      out.push({페이지:l.page, 행:i+1, 목:currentTotal?.항목 || '', 상위항목:currentTotal?.항목 || '', 항목:name, PDF금액:calc.amount, PDF금액천원:Math.round(calc.amount/1000), 인원:calc.people, 누락항목:calc.missing || [], 산출기초:t, 구분:'산출기초'});
+
+    if(!isCalcStartCandidate(t)) continue;
+
+    const block = collectCalcBlock(lines, i);
+    if(block && block.calc){
+      const name = block.calc.name || findCalcName(lines, i) || currentTotal?.항목 || '산출항목미상';
+      out.push({페이지:l.page, 행:i+1, 목:currentTotal?.항목 || '', 상위항목:currentTotal?.항목 || '', 항목:name, PDF금액:block.calc.amount, PDF금액천원:Math.round(block.calc.amount/1000), 인원:block.calc.people, 누락항목:block.calc.missing || [], 산출기초:block.basis, 구분:'산출기초'});
+      i = block.end;
     }
   }
   return out.filter(x=>!LEGAL_RE.test(x.항목));
+}
+function isCalcStartCandidate(t){
+  const s = text(t || '');
+  if(!s) return false;
+  if(/예산구분|발행일|과\s*목|산출내역|산출기초|보조금\s*및|수익자\s*부담/.test(s)) return false;
+  if(parseTotalBudgetRow(s)) return false;
+  // 산출내역은 보통 (본예산)으로 시작하지만, PDF 추출상 항목명과 산식만 남는 경우도 있어 산식 줄도 후보로 둡니다.
+  return /\(본예산\)|=\s*[0-9,]+\s*$|[0-9,]+\s*원?\s*\*/.test(s);
+}
+function collectCalcBlock(lines, startIdx){
+  const buf=[];
+  const startPage = lines[startIdx]?.page;
+  const maxEnd = Math.min(lines.length-1, startIdx + 10);
+  for(let k=startIdx;k<=maxEnd;k++){
+    const lt = lines[k];
+    if(!lt || lt.page !== startPage) break;
+    const s = text(lt.text || '');
+    if(!s) continue;
+    if(k>startIdx && parseTotalBudgetRow(s)) break;
+    if(k>startIdx && /\(본예산\)/.test(s) && parseCalcLine(buf.join(' '))){
+      break;
+    }
+    // 새 산출내역이 시작됐는데 현재 블록이 아직 금액으로 끝나지 않으면 과도하게 합치지 않습니다.
+    if(k>startIdx && /\(본예산\)/.test(s) && buf.some(x=>/=\s*[0-9,]+\s*$/.test(x))){
+      break;
+    }
+    buf.push(s);
+    const joined = buf.join(' ').replace(/\s+/g,' ').trim();
+    const calc = parseCalcLine(joined);
+    if(calc){
+      return {start:startIdx, end:k, calc, basis:joined};
+    }
+  }
+  // 시작 줄 자체가 계산식인 경우를 마지막으로 한 번 더 확인합니다.
+  const joined = buf.join(' ').replace(/\s+/g,' ').trim();
+  const calc = parseCalcLine(joined);
+  return calc ? {start:startIdx, end:startIdx, calc, basis:joined} : null;
 }
 function parseTotalBudgetRow(t){
   if(/산출|예산구분|발행일|과\s*목|보조금\s*및|수익자\s*부담|예산액\s*전년도|비교\s*증감/.test(t)) return null;
@@ -780,10 +821,10 @@ function extractCalcItemNameFromLine(t){
        .replace(/\s+/g, ' ')
        .trim();
   if(!s) return '';
-  // 산출내역과 산출기초가 같은 줄에 붙어 있는 PDF를 처리합니다.
+  // 산출내역 여러 줄 + 산출기초 여러 줄이 합쳐진 블록에서 산식 시작 전까지를 항목명으로 봅니다.
   // 예: "직책수당 (원장500,000원+부원장200,000원+교사50,000원)*12월 = 9,000,000"
-  // 예: "[방]근속수당 20,000원*1명*12월 = 240,000"
-  let m = s.match(/^(.{2,45}?)(?=\s*(?:[\{\(]\s*[^=]{0,20}?[0-9,]+원|[0-9,]+원))/);
+  // 예: "상여금 {(명절 218,182*11명)+...}=12,901,000"
+  let m = s.match(/^(.{1,80}?)(?=\s*(?:[\{\(][^=]{0,80}?[0-9,]+\s*원?|[0-9,]+\s*원?\s*\*))/);
   if(!m) return '';
   let name = cleanCalcNameCandidate(m[1]);
   if(!name) return '';
@@ -791,7 +832,7 @@ function extractCalcItemNameFromLine(t){
 }
 function parseCalcLine(t){
   const extractedName = extractCalcItemNameFromLine(t);
-  const compact = t.replace(/\s+/g,'').replace(/＝/g,'=');
+  const compact = text(t || '').replace(/\s+/g,'').replace(/＝/g,'=').replace(/[{}]/g,'');
   let m = compact.match(/([0-9,]+)원\*([0-9,]+)명\*([0-9,]+)(?:월|개월|개?월)=([0-9,]+)$/);
   if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:toNum(m[3]), amount:toNum(m[4]), missing:[], name:extractedName};
 
@@ -803,46 +844,24 @@ function parseCalcLine(t){
   m = compact.match(/([0-9,]+)원\*([0-9,]+)명=([0-9,]+)$/);
   if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:null, amount:toNum(m[3]), missing:['월수'], name:extractedName};
 
-  // 산출식은 있으나 인원/월수 구조가 불완전한 형태도 금액은 잡아 둡니다.
-  if(/원/.test(compact) && /=/.test(compact)){
+  // 복합 괄호 산식: (원장500,000원+부원장200,000원+교사50,000원)*12월=9,000,000
+  // 또는 원 단위 표기가 일부 빠진 상여금 산식도 금액과 항목명을 우선 잡습니다.
+  if(/=([0-9,]+)$/.test(compact)){
     const amountMatch = compact.match(/=([0-9,]+)$/);
-    if(amountMatch){
-      const peopleMatch = compact.match(/([0-9,]+)명/);
-      const monthMatch = compact.match(/([0-9,]+)(?:월|개월|개?월)/);
-      const unitMatch = compact.match(/([0-9,]+)원/);
-      const missing = [];
-      if(!peopleMatch) missing.push('인원 수');
-      if(!monthMatch) missing.push('월수');
-      return {
-        unit: unitMatch ? toNum(unitMatch[1]) : null,
-        people: peopleMatch ? toNum(peopleMatch[1]) : null,
-        months: monthMatch ? toNum(monthMatch[1]) : null,
-        amount: toNum(amountMatch[1]),
-        missing,
-        name: extractedName
-      };
-    }
-  }
-  // 복합 산식: 금액 단위가 일부 생략된 괄호식도 최종 금액은 잡습니다.
-  // 예: {(명절 218,182*11명)+(방학 218,182*11명)}*2회 = 12,901,000
-  if(/=/.test(compact)){
-    const amountMatch = compact.match(/=([0-9,]+)$/);
-    if(amountMatch){
-      const peopleMatch = compact.match(/([0-9,]+)명/);
-      const monthMatch = compact.match(/([0-9,]+)(?:월|개월|개?월)/);
-      const unitMatch = compact.match(/([0-9,]+)원/);
-      const missing = [];
-      if(!peopleMatch && /급여|수당|상여|인건비/.test(extractedName || compact)) missing.push('인원 수');
-      if(!monthMatch && /급여|수당/.test(extractedName || compact)) missing.push('월수');
-      return {
-        unit: unitMatch ? toNum(unitMatch[1]) : null,
-        people: peopleMatch ? toNum(peopleMatch[1]) : null,
-        months: monthMatch ? toNum(monthMatch[1]) : null,
-        amount: toNum(amountMatch[1]),
-        missing,
-        name: extractedName
-      };
-    }
+    const peopleMatches = [...compact.matchAll(/([0-9,]+)명/g)].map(m=>toNum(m[1])).filter(Boolean);
+    const monthMatch = compact.match(/([0-9,]+)(?:월|개월|개?월)/);
+    const unitMatch = compact.match(/([0-9,]+)원/);
+    const missing = [];
+    if(!peopleMatches.length) missing.push('인원 수');
+    if(!monthMatch && !/([0-9,]+)회/.test(compact)) missing.push('월수');
+    return {
+      unit: unitMatch ? toNum(unitMatch[1]) : null,
+      people: peopleMatches.length ? Math.max(...peopleMatches) : null,
+      months: monthMatch ? toNum(monthMatch[1]) : null,
+      amount: toNum(amountMatch[1]),
+      missing,
+      name: extractedName
+    };
   }
   return null;
 }
@@ -881,18 +900,14 @@ function cleanCalcNameCandidate(raw){
   return cleaned;
 }
 function findCalcName(lines, idx){
-  // 산출항목명은 대부분 산출기초 바로 위에 있습니다.
-  // 예: "근속수당" 다음 줄에 "{(20,000원*2명)+...}=960,000" 형태.
-  // 이전 버전은 아래쪽 후보를 먼저 보아 다음 항목명([방]근속수당 등)과 잘못 매칭되는 경우가 있었습니다.
-  const offsets = [-1,-2,-3,-4,-5,-6,1,2,3,4,5,6];
+  // PDF 텍스트 추출에서는 산출항목명이 산출기초의 바로 위에 오기도 하고,
+  // 바로 아래에 오기도 합니다. 한쪽 방향만 보면 직원방학휴가비처럼
+  // 다른 항목명과 잘못 매칭되는 문제가 있어 가까운 양방향 후보를 봅니다.
+  const offsets = [1,-1,2,-2,3,-3,4,-4,5,-5,6,-6];
   for(const off of offsets){
     const j = idx + off;
     if(j < 0 || j >= lines.length) continue;
-    const raw = lines[j]?.text || '';
-    // 총액행 또는 산출기초식이 들어 있는 줄은 항목명 후보에서 제외합니다.
-    if(parseTotalBudgetRow(raw)) continue;
-    if(/[0-9,]+\s*원|=\s*[0-9,]+/.test(text(raw))) continue;
-    const cand = cleanCalcNameCandidate(raw);
+    const cand = cleanCalcNameCandidate(lines[j]?.text || '');
     if(cand) return cand;
   }
   return '';
@@ -1002,52 +1017,19 @@ function allowanceGroupCandidates(groupRow, kind){
   if(groupRow.기타금액) out.push({label:`${kind}수당`, amount:Number(groupRow.기타금액||0)});
   return out.filter((x,i,a)=>x.amount && a.findIndex(y=>y.amount===x.amount)===i);
 }
-function allowancePdfSearchText(x){
-  return norm(`${x?.항목 || ''} ${x?.산출기초 || ''}`);
-}
-function sameAllowanceKeyFromText(key, haystack){
-  const h = norm(haystack || '');
-  if(!key || !h) return false;
-  if(h.includes(key)) return true;
-  if(key === '정액급식') return /(식대|급식수당|급식보조|정액급식)/.test(h);
-  if(key === '상여') return /(상여금|명절|방학|행사|스승의날)/.test(h);
-  if(key === '직책급') return /(직책수당|직책급|원장|부원장)/.test(h);
-  if(key === '자가운전') return /(자가운전|운전수당|교통보조|차량유지)/.test(h);
-  return false;
-}
 function findAllowancePdfMatches(kind, allowanceName, amount, pdfItems){
   const key = allowanceKey(allowanceName);
-  const allowanceMok = kind === '교원' ? '교원수당' : '직원수당';
-  const candidates = (pdfItems || []).filter(x=>{
+  return pdfItems.filter(x=>{
     if(x.구분 !== '산출기초') return false;
-    if(LEGAL_RE.test(x.항목 || '')) return false;
-    const mok = norm(x.목 || x.상위항목 || '');
-    return mok === norm(allowanceMok) || mok.includes(norm(allowanceMok));
-  });
-
-  // 1차: 같은 목 안에서 정규화된 수당명이 같은 모든 산출기초를 합산합니다.
-  // [방]근속수당, [급]급식수당처럼 기관 내부 태그가 붙은 항목도 같은 수당으로 봅니다.
-  let matches = candidates.filter(x=>{
-    const k2 = allowanceKey(x.항목 || '');
-    if(k2 && key && (k2 === key || k2.includes(key) || key.includes(k2))) return true;
-    return sameAllowanceKeyFromText(key, allowancePdfSearchText(x));
-  });
-
-  // 2차: 항목명이 산출기초 줄에서 누락되거나 괄호 산식으로 처리된 경우 산출기초 원문까지 검색합니다.
-  if(!matches.length){
-    matches = candidates.filter(x=>sameAllowanceKeyFromText(key, allowancePdfSearchText(x)));
-  }
-
-  // 금액으로 개별 행을 잘라내지 않습니다. 같은 수당이 여러 줄로 나뉜 경우 합산 후 판단합니다.
-  const seen = new Set();
-  return matches.filter(x=>{
-    const k = `${x.페이지}|${x.행}|${x.항목}|${x.PDF금액}|${x.산출기초}`;
-    if(seen.has(k)) return false;
-    seen.add(k);
-    return true;
+    if(!allowancePdfHit(kind, key, amount, x)) return false;
+    // 같은 명칭이어도 PDF 추출이 엇갈린 경우를 막기 위해 금액도 함께 확인합니다.
+    // 다만 PDF가 같은 항목을 재원별로 나눈 경우에는 합산 단계에서 처리되므로
+    // 개별 산출기초 금액이 엑셀금액 이하인 경우까지 허용합니다.
+    const pdfAmt = Number(x.PDF금액 || 0);
+    const excelAmt = Number(amount || 0);
+    return !excelAmt || closeMoney(pdfAmt, excelAmt) || pdfAmt <= excelAmt;
   });
 }
-
 function integratedText(kind, list, amountField, groupLabel, groupAmount){
   const expr = list.map(a=>`${a.항목}(${fmt(a[amountField])})`).join(' + ');
   return `${expr} = ${groupLabel}(${fmt(groupAmount)})으로 통합편성 추정`;
@@ -1229,16 +1211,9 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupRowOrTotal){
     const matches = findAllowancePdfMatches(kind, a.항목, amount, pdfItems);
     const pdfAmount = matches.reduce((s,x)=>s+Number(x.PDF금액||0),0);
     const pdfPeople = matches.reduce((s,x)=>s+Number(x.인원||0),0);
-    if(matches.length && closeMoney(pdfAmount, amount)){
+    if(matches.length){
       direct.push(a);
-      const labels = [...new Set(matches.map(m=>cleanItemName(m.항목)).filter(Boolean))].join(', ');
-      details.push({항목:`${kind} ${a.항목}`, 엑셀금액:amount, 엑셀인원:a[peopleField]||'', PDF금액:pdfAmount, PDF인원:pdfPeople||'', 검토결과:`개별편성 확인(${labels})`});
-    }else if(matches.length){
-      // 같은 명칭은 찾았지만 금액이 맞지 않으면 통합편성 잔액 판단 대상으로 넘깁니다.
-      // 표에는 실제 확인된 PDF금액을 남겨 원인을 확인할 수 있게 합니다.
-      missing.push(a);
-      const labels = [...new Set(matches.map(m=>cleanItemName(m.항목)).filter(Boolean))].join(', ');
-      details.push({항목:`${kind} ${a.항목}`, 엑셀금액:amount, 엑셀인원:a[peopleField]||'', PDF금액:pdfAmount, PDF인원:pdfPeople||'', 검토결과:`추가확인필요: PDF ${labels || '동일명칭'} 금액 ${fmt(pdfAmount)} / 엑셀 ${fmt(amount)}`});
+      details.push({항목:`${kind} ${a.항목}`, 엑셀금액:amount, 엑셀인원:a[peopleField]||'', PDF금액:pdfAmount, PDF인원:pdfPeople||'', 검토결과:`개별편성 확인(${[...new Set(matches.map(m=>cleanItemName(m.항목)).filter(Boolean))].join(', ')})`});
     }else{
       missing.push(a);
     }
@@ -1262,7 +1237,6 @@ function analyzeAllowances(kind, allowanceRows, pdfItems, groupRowOrTotal){
   const integratedMessage = coveredByGroup && missing.length ? integratedText(kind, missing, amountField, `${kind}수당`, matched.amount) : '';
 
   for(const a of missing){
-    if(details.some(d=>d.항목 === `${kind} ${a.항목}`)) continue;
     const amount = Number(a[amountField]||0);
     let msg = '';
     if(integratedMessage) msg = integratedMessage;
@@ -1341,21 +1315,22 @@ function allowanceKey(s){
   k = k.replace(/^(?:\[[^\]]+\])+/g, '');
   // 소속/직종 접두어는 같은 항목 매칭에서 제외합니다.
   k = k.replace(/^(교원|직원|교사|사무직원|조리직원|보조교사)/,'');
-  // 접두어 제거 뒤에 다시 태그가 오는 경우도 보정합니다. 예: 교원[방]근속수당
+  // 접두어 제거 후 다시 [방] 같은 태그가 나오는 경우도 제거합니다. 예: 교원[방]근속수당
   k = k.replace(/^(?:\[[^\]]+\])+/g, '');
 
   // 기관마다 다른 명칭을 같은 수당으로 봅니다.
-  if(/^(식대|급식비|정액급식비|정액급식|급식수당)$/.test(k) || /정액급식/.test(k)) return '정액급식';
+  if(/^(식대|급식비|정액급식비|정액급식|급식수당|급식보조비)$/.test(k) || /정액급식/.test(k)) return '정액급식';
   if(/성과상여/.test(k)) return '성과상여';
-  if(/^상여금?$/.test(k) || /상여/.test(k)) return '상여';
   if(/명절휴가/.test(k)) return '명절휴가';
   if(/스승의날/.test(k)) return '스승의날상여';
   if(/방학휴가/.test(k)) return '방학휴가';
-  if(/자가운전|자가차량|차량유지/.test(k)) return '자가운전';
+  if(/자가운전|자가차량|차량유지|운전수당|교통보조/.test(k)) return '자가운전';
   if(/직책급|직책/.test(k)) return '직책급';
+  // 해아뜰처럼 PDF와 엑셀 모두 단순히 '상여금'으로 적힌 경우를 처리합니다.
+  // 단, 명절/스승의날/방학/성과상여는 위에서 먼저 분리했으므로 여기서는 일반 상여금만 묶습니다.
+  if(/^상여금?$/.test(k) || k === '상여') return '상여';
 
-  const stripped = k.replace(/수당|보조금|지원비|지원금|휴가비|급식비|식대|비/g,'');
-  // 전부 지워져 빈 키가 되면 원 명칭을 보수적으로 유지합니다.
+  const stripped = k.replace(/수당|보조금|지원비|지원금|상여금|휴가비|급식비|식대|비/g,'');
   return stripped || k;
 }
 
