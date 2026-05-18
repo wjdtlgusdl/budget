@@ -2600,3 +2600,122 @@ analyzeAllowances = function(kind, allowanceRows, pdfItems, groupRowOrTotal){
   }
   return res;
 };
+
+/* ===== v63 경기/해아뜰 개별수당 승격 보강 =====
+   - 유아학비_/그밖의_/수익자_ 같은 재원 접두어 뒤의 수당명이 줄바꿈으로 일부 잘려도,
+     해당 수당 목 내부에서 금액이 정확히 맞는 산출기초는 개별편성으로 우선 확정합니다.
+   - 통합편성 후보는 마지막 fallback으로만 사용합니다.
+*/
+const __cleanItemName_base_v63 = cleanItemName;
+cleanItemName = function(name){
+  let s = __cleanItemName_base_v63(name);
+  const n = norm(s);
+  if(/^액급식비/.test(s) || /^액급식비/.test(n)) return '정액급식비';
+  if(/^책수당/.test(s) || /^책수당/.test(n)) return '직책수당';
+  if(/^근수당/.test(s) || /^근수당/.test(n)) return '정근수당';
+  if(/^구보조비/.test(s) || /^구보조비/.test(n)) return '연구보조비';
+  if(/^절방학휴가비/.test(s) || /^절방학휴가비/.test(n)) return '명절방학휴가비';
+  return s;
+};
+
+function v63LabelFromAllowanceName(raw){
+  const n = norm(raw || '');
+  if(/정액급식|급식|식대/.test(n)) return '정액급식비';
+  if(/직책/.test(n)) return '직책수당';
+  if(/정근|근속/.test(n)) return /근속/.test(n) ? '근속수당' : '정근수당';
+  if(/연구보조/.test(n)) return '연구보조비';
+  if(/연구/.test(n)) return '연구수당';
+  if(/휴가/.test(n)) return '명절방학휴가비';
+  if(/상여/.test(n)) return '상여금';
+  if(/운전|자가운전|교통/.test(n)) return '운전수당';
+  if(/기타/.test(n)) return '기타수당';
+  return raw || '';
+}
+
+function v63IsGenericAllowanceCalc(kind, x){
+  const item = norm(cleanItemName(x?.항목 || ''));
+  const mokName = kind === '교원' ? '교원수당' : '직원수당';
+  return item === norm(mokName) || item === norm(kind + '수당') || allowanceKey(item) === '수당';
+}
+
+function v63FindExactAllowanceCalc(kind, allowanceName, excelAmt, pdfItems, usedIds){
+  const keys = allowanceKeys(allowanceName);
+  const candidates = [];
+  for(const x of (pdfItems || [])){
+    if(!x || x.구분 !== '산출기초') continue;
+    if(!isRightAllowanceMok_v59(kind, x)) continue;
+    if(v63IsGenericAllowanceCalc(kind, x)) continue;
+    const amt = Number(x.PDF금액 || 0);
+    if(!amt || !closeMoney(amt, excelAmt, 2000)) continue;
+    const id = `${x.페이지}|${x.행}|${x.목}|${x.항목}|${x.PDF금액}`;
+    if(usedIds && usedIds.has(id)) continue;
+    const labelText = norm(`${x.항목 || ''} ${x.산출기초 || ''}`);
+    const display = norm(displayItemName_v61 ? displayItemName_v61(x) : cleanItemName(x.항목 || ''));
+    const semantic = keys.some(k => allowanceCandidateByKey_v59(kind, k, x) || allowancePdfHit(kind, k, excelAmt, x));
+    // 의미 매칭이 약해도, 같은 수당 목 내부에서 금액이 정확히 맞고 항목명/산출기초에 수당성 단어가 있으면 후보로 인정
+    const allowanceLike = /(수당|급식|식대|휴가|상여|보조|정근|직책|직급|연구|운전)/.test(labelText + display);
+    if(semantic || allowanceLike){
+      candidates.push({x, id, semantic, labelLen:(display || labelText).length});
+    }
+  }
+  candidates.sort((a,b)=>{
+    if(a.semantic !== b.semantic) return a.semantic ? -1 : 1;
+    return b.labelLen - a.labelLen;
+  });
+  return candidates[0]?.x || null;
+}
+
+const __analyzeAllowances_base_v63 = analyzeAllowances;
+analyzeAllowances = function(kind, allowanceRows, pdfItems, groupRowOrTotal){
+  const res = __analyzeAllowances_base_v63(kind, allowanceRows, pdfItems, groupRowOrTotal);
+  try{
+    const amountField = kind === '교원' ? '교원금액' : '직원금액';
+    const peopleField = kind === '교원' ? '교원인원' : '직원인원';
+    const usedIds = new Set();
+    // 이미 개별로 잡힌 PDF 항목은 재사용하지 않도록 대략적인 ID를 수집
+    for(const d of (res.details || [])){
+      if(Number(d.PDF금액 || 0) > 0 && /^개별편성/.test(d.검토결과 || '')){
+        // 세부 id는 detail에 없으므로 금액+표시명 수준으로만 중복 방지. 실제 후보에서는 금액 중복이 흔치 않음.
+      }
+    }
+    const relevant = (allowanceRows || []).filter(a => Number(a?.[amountField] || 0) > 0);
+    for(const a of relevant){
+      const targetName = norm(`${kind} ${a.항목}`);
+      const current = (res.details || []).find(d => norm(d.항목 || '') === targetName);
+      const needsUpgrade = !current || Number(current.PDF금액 || 0) === 0 || /통합편성/.test(current.검토결과 || '');
+      if(!needsUpgrade) continue;
+      const excelAmt = Number(a[amountField] || 0);
+      const best = v63FindExactAllowanceCalc(kind, a.항목, excelAmt, pdfItems, usedIds);
+      if(!best) continue;
+      const id = `${best.페이지}|${best.행}|${best.목}|${best.항목}|${best.PDF금액}`;
+      usedIds.add(id);
+      const pdfAmt = Number(best.PDF금액 || 0);
+      let name = displayItemName_v61 ? displayItemName_v61(best) : cleanItemName(best.항목 || '');
+      const fallback = v63LabelFromAllowanceName(a.항목);
+      // 잘린 이름이거나 너무 포괄적인 이름이면 엑셀 항목명을 기준으로 보기 좋은 이름을 사용
+      if(!name || name.length < 3 || /^(정액|수당|보조비)$/.test(norm(name)) || /^액급식/.test(norm(name))) name = fallback;
+      const diff = Math.abs(Math.round(excelAmt - pdfAmt));
+      const result = closeMoney(pdfAmt, excelAmt, 2000)
+        ? `개별편성확인(금액일치: ${name})`
+        : `개별편성확인(${fmt(diff)} 차이: ${name})`;
+      let replaced = false;
+      res.details = (res.details || []).map(d => {
+        if(norm(d.항목 || '') === targetName){
+          replaced = true;
+          return {...d, PDF금액: pdfAmt, PDF인원: Number(best.인원 || 0) || d.PDF인원 || '', 검토결과: result};
+        }
+        return d;
+      });
+      if(!replaced){
+        res.details.push({항목:`${kind} ${a.항목}`, 엑셀금액:excelAmt, 엑셀인원:a[peopleField]||'', PDF금액:pdfAmt, PDF인원:Number(best.인원||0)||'', 검토결과:result});
+      }
+      res.missing = (res.missing || []).filter(m => norm(m.항목 || '') !== norm(a.항목 || ''));
+      if(!(res.direct || []).some(m => norm(m.항목 || '') === norm(a.항목 || ''))) res.direct = [...(res.direct || []), a];
+    }
+    res.missingSum = (res.missing || []).reduce((s,a)=>s+Number(a?.[amountField]||0),0);
+    if(!(res.missing || []).length) res.verdict = '개별 또는 총액 확인';
+  }catch(e){
+    console.warn('v63 allowance exact upgrade skipped', e);
+  }
+  return res;
+};
