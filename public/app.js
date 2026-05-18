@@ -735,7 +735,7 @@ function extractBudgetItems(lines){
     }
     const calc = parseCalcLine(t);
     if(calc){
-      const name = findCalcName(lines, i) || currentTotal?.항목 || '산출항목미상';
+      const name = calc.name || findCalcName(lines, i) || currentTotal?.항목 || '산출항목미상';
       out.push({페이지:l.page, 행:i+1, 목:currentTotal?.항목 || '', 상위항목:currentTotal?.항목 || '', 항목:name, PDF금액:calc.amount, PDF금액천원:Math.round(calc.amount/1000), 인원:calc.people, 누락항목:calc.missing || [], 산출기초:t, 구분:'산출기초'});
     }
   }
@@ -774,18 +774,34 @@ function validBudgetRowName(name){
   if(/^[\d,\-]+$/.test(name)) return false;
   return true;
 }
+function extractCalcItemNameFromLine(t){
+  let s = text(t || '');
+  s = s.replace(/\(본예산\)|\(보조금및지원금\)|\(수익자부담금\)|\(그밖의수입\)/g, ' ')
+       .replace(/\s+/g, ' ')
+       .trim();
+  if(!s) return '';
+  // 산출내역과 산출기초가 같은 줄에 붙어 있는 PDF를 처리합니다.
+  // 예: "직책수당 (원장500,000원+부원장200,000원+교사50,000원)*12월 = 9,000,000"
+  // 예: "[방]근속수당 20,000원*1명*12월 = 240,000"
+  let m = s.match(/^(.{2,45}?)(?=\s*(?:[\{\(]\s*[^=]{0,20}?[0-9,]+원|[0-9,]+원))/);
+  if(!m) return '';
+  let name = cleanCalcNameCandidate(m[1]);
+  if(!name) return '';
+  return name;
+}
 function parseCalcLine(t){
+  const extractedName = extractCalcItemNameFromLine(t);
   const compact = t.replace(/\s+/g,'').replace(/＝/g,'=');
   let m = compact.match(/([0-9,]+)원\*([0-9,]+)명\*([0-9,]+)(?:월|개월|개?월)=([0-9,]+)$/);
-  if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:toNum(m[3]), amount:toNum(m[4]), missing:[]};
+  if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:toNum(m[3]), amount:toNum(m[4]), missing:[], name:extractedName};
 
   // 인원 수가 빠진 형태: 3,600,000원*12월=43,200,000
   m = compact.match(/([0-9,]+)원\*([0-9,]+)(?:월|개월|개?월)=([0-9,]+)$/);
-  if(m) return {unit:toNum(m[1]), people:null, months:toNum(m[2]), amount:toNum(m[3]), missing:['인원 수']};
+  if(m) return {unit:toNum(m[1]), people:null, months:toNum(m[2]), amount:toNum(m[3]), missing:['인원 수'], name:extractedName};
 
   // 월수/개월 수가 빠진 형태: 100,000원*5명=500,000
   m = compact.match(/([0-9,]+)원\*([0-9,]+)명=([0-9,]+)$/);
-  if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:null, amount:toNum(m[3]), missing:['월수']};
+  if(m) return {unit:toNum(m[1]), people:toNum(m[2]), months:null, amount:toNum(m[3]), missing:['월수'], name:extractedName};
 
   // 산출식은 있으나 인원/월수 구조가 불완전한 형태도 금액은 잡아 둡니다.
   if(/원/.test(compact) && /=/.test(compact)){
@@ -802,7 +818,8 @@ function parseCalcLine(t){
         people: peopleMatch ? toNum(peopleMatch[1]) : null,
         months: monthMatch ? toNum(monthMatch[1]) : null,
         amount: toNum(amountMatch[1]),
-        missing
+        missing,
+        name: extractedName
       };
     }
   }
@@ -1254,6 +1271,8 @@ function allowanceVerdict(kind, allowanceRows, pdfItems, groupTotal){
 function allowanceKey(s){
   let k = norm(s);
   if(!k) return '';
+  // [방], [급], [운영]처럼 기관 내부 구분 태그는 같은 수당명으로 봅니다.
+  k = k.replace(/^(?:\[[^\]]+\])+/g, '');
   // 소속/직종 접두어는 같은 항목 매칭에서 제외합니다.
   k = k.replace(/^(교원|직원|교사|사무직원|조리직원|보조교사)/,'');
 
