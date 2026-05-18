@@ -1450,3 +1450,348 @@ function render(report){
   reviewHtml += '<h3 class="section-title">지적사항</h3>' + table(['번호','지적내용','근거'], review.issues || []);
   $('precheck').innerHTML = reviewHtml;
 }
+
+/* =========================
+   v50 보강 패치
+   - 작성서식 PDF 1차 지원
+   - 시트명/내용 기반 탐색 강화
+   - 퇴직금 교원/직원 구분 보조
+   - 수식 셀 일부 계산 보정
+   - 오편성/미편성 지적사항 문구 개선
+   ========================= */
+
+const SOURCE_PDF_NOTICE = '작성서식 PDF는 엑셀에서 변환된 텍스트형 PDF만 지원합니다. 스캔본 PDF는 브라우저 정적 방식에서 정확히 읽기 어렵습니다.';
+
+async function parseExcel(file){
+  const lower = String(file.name || '').toLowerCase();
+  if(lower.endsWith('.pdf')) return await parseSourceFormPdf(file);
+  const originalBuf = await file.arrayBuffer();
+  const attempts = [];
+  try{ attempts.push(await parseExcelWithSheetJS_v50(file.name, originalBuf)); }
+  catch(e){ attempts.push({parser:'sheetjs-v50', error:e.message, salaryCandidates:[], salary:null, visibleSheets:[]}); console.warn(e); }
+  try{ attempts.push(await parseExcelWithRawXml_v50(file.name, originalBuf)); }
+  catch(e){ attempts.push({parser:'raw-xlsx-xml-v50', error:e.message, salaryCandidates:[], salary:null, visibleSheets:[]}); console.warn(e); }
+  const successful = attempts.filter(x=>x && x.salary && x.salary.ok);
+  let chosen = successful[0];
+  if(successful.length > 1) chosen = successful.sort((a,b)=>selectedSalaryScore(b)-selectedSalaryScore(a))[0];
+  if(!chosen) chosen = attempts.sort((a,b)=>(b.salaryCandidates?.length||0)-(a.salaryCandidates?.length||0))[0] || {fileName:file.name};
+  chosen.fileName = file.name;
+  chosen.parserAttempts = attempts.map(a=>({
+    parser:a.parser, error:a.error||'', visibleSheets:a.visibleSheets||[],
+    salaryFound:!!(a.salary&&a.salary.ok), salarySheet:a.salary?.sheetName||'', candidates:a.salaryCandidates||[]
+  }));
+  return chosen;
+}
+
+async function parseExcelWithSheetJS_v50(fileName, originalBuf){
+  const normalizedBuf = await normalizeXlsxForSheetJS(originalBuf);
+  const wb = XLSX.read(normalizedBuf, {type:'array', cellDates:false, cellNF:false, cellText:true, raw:false, WTF:false, dense:false});
+  const sheetMeta = (wb.Workbook && wb.Workbook.Sheets) || [];
+  const visible = wb.SheetNames.map((name,i)=>({name, hidden: sheetMeta[i]?.Hidden || 0})).filter(s=>!s.hidden);
+  const sheetAoas = new Map();
+  const candidates = visible.map(s=>{
+    const aoa = sheetToAoaRobust_v50(wb.Sheets[s.name]);
+    sheetAoas.set(s.name, aoa);
+    return {...s, score: sheetScore_v50(s.name, aoa)};
+  }).filter(s=>s.score>0).sort((a,b)=>b.score-a.score);
+  let salary=null; const tried=[];
+  for(const c of candidates){
+    const parsed = parseSalarySheet(c.name, sheetAoas.get(c.name) || []);
+    tried.push({sheet:c.name, score:c.score, found:!!parsed.ok, message:parsed.message||'', parser:'sheetjs-v50'});
+    if(parsed.ok){ salary=parsed; break; }
+  }
+  const retireSheets = visible
+    .map(s=>({s, aoa:sheetAoas.get(s.name) || sheetToAoaRobust_v50(wb.Sheets[s.name])}))
+    .filter(x=>RETIRE_RE.test(x.s.name) || sheetContentHit(x.aoa, /(퇴직|적립금이월액|퇴직적립금|퇴직급여충당)/))
+    .map(x=>parseRetireSheet(x.s.name, x.aoa));
+  return {fileName, parser:'sheetjs-v50', visibleSheets:visible.map(s=>s.name), salaryCandidates:tried, salary, retirement:retireSheets};
+}
+
+async function parseExcelWithRawXml_v50(fileName, originalBuf){
+  const rawBook = await readXlsxRawWorkbook(originalBuf);
+  const visible = rawBook.sheets.filter(s=>!s.hidden);
+  const aoaMap = new Map();
+  for(const s of visible){ try{ aoaMap.set(s.name, await rawBook.getAoa(s.name)); }catch(e){ aoaMap.set(s.name, []); } }
+  const candidates = visible.map(s=>({...s, score:sheetScore_v50(s.name, aoaMap.get(s.name)||[])})).filter(s=>s.score>0).sort((a,b)=>b.score-a.score);
+  let salary=null; const tried=[];
+  for(const c of candidates){
+    const parsed = parseSalarySheet(c.name, aoaMap.get(c.name)||[]);
+    tried.push({sheet:c.name, score:c.score, found:!!parsed.ok, message:parsed.message||'', parser:'raw-xlsx-xml-v50'});
+    if(parsed.ok){ salary=parsed; break; }
+  }
+  const retireSheets = visible
+    .filter(s=>RETIRE_RE.test(s.name) || sheetContentHit(aoaMap.get(s.name)||[], /(퇴직|적립금이월액|퇴직적립금|퇴직급여충당)/))
+    .map(s=>parseRetireSheet(s.name, aoaMap.get(s.name)||[]));
+  return {fileName, parser:'raw-xlsx-xml-v50', visibleSheets:visible.map(s=>s.name), salaryCandidates:tried, salary, retirement:retireSheets};
+}
+
+function sheetScore_v50(name, aoa){
+  let score = sheetScore(name);
+  const joined = (aoa || []).slice(0,120).map(r=>(r||[]).map(text).join(' ')).join(' ');
+  const n = norm(joined);
+  if(/교직원.*보수|보수.*일람|보수기준|급여기준|직명.*성명|본봉|기본급|지급액계|월지급액|소계교원|소계직원|소계일반직/.test(n)) score += 90;
+  if(/직명/.test(n) && (/본봉|기본급/.test(n)) && /지급액/.test(n)) score += 100;
+  if(/퇴직|적립금이월액/.test(n)) score -= 60;
+  if(/세출예산명세서|세입예산명세서/.test(n)) score -= 80;
+  return Math.max(0, score);
+}
+function sheetContentHit(aoa, re){
+  const joined = (aoa || []).slice(0,100).map(r=>(r||[]).map(text).join(' ')).join(' ');
+  return re.test(joined);
+}
+
+function sheetToAoaRobust_v50(ws){
+  if(!ws || !ws['!ref']) return [];
+  const aoa = sheetToAoaRobust(ws);
+  let range;
+  try{ range = XLSX.utils.decode_range(ws['!ref']); }catch(e){ return aoa; }
+  const maxR = Math.min(range.e.r, 200), maxC = Math.min(range.e.c, 260);
+  for(let R=range.s.r; R<=maxR; R++){
+    if(!aoa[R]) aoa[R]=[];
+    for(let C=range.s.c; C<=maxC; C++){
+      if(aoa[R][C] !== undefined && aoa[R][C] !== '') continue;
+      const addr = XLSX.utils.encode_cell({r:R,c:C}); const cell = ws[addr];
+      if(!cell) continue;
+      if(cell.w !== undefined && cell.w !== '') aoa[R][C]=cell.w;
+      else if(cell.v !== undefined && cell.v !== '') aoa[R][C]=cell.v;
+      else if(cell.f) aoa[R][C]=evaluateSimpleFormula(ws, cell.f);
+    }
+  }
+  return aoa;
+}
+function evaluateSimpleFormula(ws, f){
+  try{
+    let expr = String(f||'').replace(/^=/,'').toUpperCase();
+    expr = expr.replace(/SUM\(([A-Z]+\d+):([A-Z]+\d+)\)/g, (_,a,b)=>String(sumRange(ws,a,b)));
+    expr = expr.replace(/([A-Z]+\d+)/g, m=>String(toNum(ws[m]?.v ?? ws[m]?.w ?? 0)));
+    if(/^[0-9+\-*/().\s]+$/.test(expr)){
+      const val = Function('"use strict";return ('+expr+')')();
+      return isFinite(val) ? val : '';
+    }
+  }catch(e){}
+  return '';
+}
+function sumRange(ws,a,b){
+  const ca = XLSX.utils.decode_cell(a), cb = XLSX.utils.decode_cell(b);
+  let s=0;
+  for(let r=Math.min(ca.r,cb.r); r<=Math.max(ca.r,cb.r); r++) for(let c=Math.min(ca.c,cb.c); c<=Math.max(ca.c,cb.c); c++){
+    const addr = XLSX.utils.encode_cell({r,c}); s += toNum(ws[addr]?.v ?? ws[addr]?.w ?? 0);
+  }
+  return s;
+}
+
+async function parseSourceFormPdf(file){
+  const parsed = await parsePdf(file);
+  const lines = parsed.lines || [];
+  const joined = lines.map(l=>l.텍스트).join(' ');
+  const retirement = parseRetireFromSourcePdfLines(lines);
+  const salary = parseSalaryFromSourcePdfLines(lines);
+  return {
+    fileName:file.name,
+    parser:'source-form-pdf-v50',
+    sourcePdfNotice:SOURCE_PDF_NOTICE,
+    visibleSheets:['PDF 작성서식'],
+    salaryCandidates:[{sheet:'PDF 작성서식', score: salary?.ok ? 100 : 0, found:!!salary?.ok, message: salary?.ok ? 'PDF 텍스트에서 보수표 추정' : 'PDF에서 교직원보수 표를 구조적으로 읽지 못했습니다.', parser:'source-form-pdf-v50'}],
+    salary,
+    retirement,
+    pdfLines:lines.slice(0,500),
+    contentHint: joined.slice(0,1000)
+  };
+}
+
+function parseRetireFromSourcePdfLines(lines){
+  const out=[];
+  const hitPages = new Set(lines.filter(l=>/퇴직|적립금이월액|퇴직적립금/.test(l.텍스트)).map(l=>l.페이지));
+  for(const page of hitPages){
+    const chunk = lines.filter(l=>l.페이지===page).map(l=>l.텍스트).join(' ');
+    const nums = [...chunk.matchAll(/[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{6,}/g)].map(m=>toNum(m[0])).filter(n=>n>0);
+    const amount = nums.length ? nums[nums.length-1] : 0;
+    out.push({sheetName:`PDF ${page}쪽 퇴직금`, positiveAmount:amount, hasRetirementAmount:amount>0, retireColumns:[], positiveCells:amount?[{행:page, 열:'PDF', 값:amount, 헤더:'PDF 퇴직/적립금 추정', 주변:chunk.slice(0,180)}]:[], 기준:'PDF 텍스트 내 퇴직/적립금 추정'});
+  }
+  return out;
+}
+
+function parseSalaryFromSourcePdfLines(lines){
+  // 텍스트형 작성서식 PDF에서 열 구조가 보존된 경우를 위한 1차 추정 파서입니다.
+  // 정확한 엑셀 표 구조가 사라진 PDF는 결과 확인 표에서 원문을 확인해야 합니다.
+  const salaryLines = lines.filter(l=>/교직원|보수|급여|수당|직명|본봉|기본급|지급액|소계/.test(l.텍스트));
+  if(!salaryLines.length) return null;
+  const teacherRows=[], staffRows=[], allowancesMap=new Map();
+  let section='';
+  for(let idx=0; idx<salaryLines.length; idx++){
+    const raw = salaryLines[idx].텍스트;
+    const n = norm(raw);
+    if(/교원|원장|교사/.test(n) && /소계|합계|계/.test(n)) section='교원';
+    if(/직원|일반직|사무|조리|차량|보조/.test(n) && /소계|합계|계/.test(n)) section='직원';
+    const nums = [...raw.matchAll(/[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{6,}/g)].map(m=>toNum(m[0])).filter(x=>x>0);
+    if(!nums.length) continue;
+    if(/소계|합계|계/.test(n)){
+      const last = nums[nums.length-1];
+      const base = nums.find(x=>x>=1000000) || last;
+      const row = {행:idx+1, 직명: section || (/(교원|교사|원장)/.test(n)?'교원':'직원'), 성명:'PDF소계', 본봉:base, 지급액계:last, 수당:{}};
+      if(/교원|원장|교사/.test(n)) teacherRows.push(row); else staffRows.push(row);
+    }
+    const allowanceCandidates = ['정액급식비','급식비','명절휴가비','스승의날상여금','방학휴가비','성과상여금','시간외수당','직급보조비','관리업무수당','기타수당','자가운전보조금','연구활동비','연구수당'];
+    for(const key of allowanceCandidates){
+      if(norm(raw).includes(norm(key))){
+        const k = cleanHeader(key); const amount = nums[nums.length-1];
+        if(!allowancesMap.has(k)) allowancesMap.set(k,{항목:k, 교원금액:0, 직원금액:0, 교원인원:0, 직원인원:0});
+        const obj=allowancesMap.get(k);
+        if(/직원|사무|조리|차량|보조|일반직/.test(n)) obj.직원금액 += amount; else obj.교원금액 += amount;
+      }
+    }
+  }
+  const tBase = teacherRows.reduce((s,r)=>s+Number(r.본봉||0),0), sBase=staffRows.reduce((s,r)=>s+Number(r.본봉||0),0);
+  if(!tBase && !sBase && !allowancesMap.size) return null;
+  return {
+    ok:true, sheetName:'PDF 작성서식', header:{source:'PDF 텍스트 추정', notice:SOURCE_PDF_NOTICE},
+    teacherRows, staffRows,
+    summary:{
+      교원:{인원:teacherRows.length, 본봉:tBase, 지급액계:teacherRows.reduce((s,r)=>s+Number(r.지급액계||0),0), 소계본봉:tBase, 소계지급액계:teacherRows.reduce((s,r)=>s+Number(r.지급액계||0),0)},
+      직원:{인원:staffRows.length, 본봉:sBase, 지급액계:staffRows.reduce((s,r)=>s+Number(r.지급액계||0),0), 소계본봉:sBase, 소계지급액계:staffRows.reduce((s,r)=>s+Number(r.지급액계||0),0)},
+      수당:[...allowancesMap.values()].filter(x=>x.교원금액||x.직원금액)
+    },
+    message:'작성서식 PDF 텍스트에서 추정 추출했습니다. 원문 PDF 구조에 따라 확인이 필요합니다.'
+  };
+}
+
+function getExcelRetirementSummary(retirementSheets){
+  const sheets = retirementSheets || [];
+  const amount = sheets.reduce((sum,r)=>sum+Number(r.positiveAmount||0),0);
+  const byKind = {교원:0, 직원:0, 공통:0};
+  for(const r of sheets){
+    const ctx = norm([r.sheetName, ...(r.positiveCells||[]).map(c=>`${c.헤더||''} ${c.주변||''}`)].join(' '));
+    const val = Number(r.positiveAmount||0);
+    if(!val) continue;
+    if(/교원|교사|원장/.test(ctx)) byKind.교원 += val;
+    else if(/직원|일반직|사무|조리|차량|보조|영양/.test(ctx)) byKind.직원 += val;
+    else byKind.공통 += val;
+  }
+  return {amount, has:amount>0, byKind, sheets:sheets.filter(r=>Number(r.positiveAmount||0)>0).map(r=>r.sheetName), cells:sheets.flatMap(r=>(r.positiveCells||[]).map(c=>({...c, sheetName:r.sheetName}))).slice(0,30)};
+}
+
+function getPdfRetirementSummary(pdfItems){
+  const items = pdfItems || [];
+  const all = items.filter(x=>Number(x.PDF금액||0)>0 && (isRetirementName(x.항목 || x.목) || isRetirementName(x.산출기초||'')));
+  const totalRows = all.filter(x=>x.구분==='총액행');
+  const used = totalRows.length ? totalRows : all.filter(x=>x.구분==='산출기초');
+  const byName = new Map();
+  for(const x of used){
+    const key = norm(x.항목 || x.목 || x.산출기초);
+    const prev = byName.get(key);
+    if(!prev || Number(x.PDF금액||0) > Number(prev.PDF금액||0)) byName.set(key,x);
+  }
+  const vals=[...byName.values()];
+  const byKind={교원:0, 직원:0, 공통:0};
+  for(const x of vals){
+    const ctx = norm(`${x.목||''} ${x.항목||''} ${x.산출기초||''}`);
+    if(/교원|교사|원장/.test(ctx)) byKind.교원 += Number(x.PDF금액||0);
+    else if(/직원|일반직|사무|조리|차량|보조|영양/.test(ctx)) byKind.직원 += Number(x.PDF금액||0);
+    else byKind.공통 += Number(x.PDF금액||0);
+  }
+  return {has:vals.length>0, amount:vals.reduce((s,x)=>s+Number(x.PDF금액||0),0), items:vals, byKind};
+}
+
+function retirementVerdict(excelSummary, pdfSummary){
+  const ea = Number(excelSummary.amount || 0), pa = Number(pdfSummary.amount || 0);
+  if(ea > 0 && pa > 0){
+    const notes=[];
+    if(excelSummary.byKind?.교원>0 && !(pdfSummary.byKind?.교원>0 || pdfSummary.byKind?.공통>0)) notes.push('교원 퇴직적립금 편성 확인 필요');
+    if(excelSummary.byKind?.직원>0 && !(pdfSummary.byKind?.직원>0 || pdfSummary.byKind?.공통>0)) notes.push('직원 퇴직적립금 편성 확인 필요');
+    return notes.length ? `편성 일부 확인 필요(${notes.join(', ')})` : `편성 확인(금액 비교 제외 · PDF ${fmt(pa)})`;
+  }
+  if(ea > 0 && pa <= 0) return `미편성(작성서식 적립금액 있음 · PDF 퇴직 관련 편성 없음)`;
+  if(ea <= 0 && pa > 0) return `참고: PDF에는 퇴직 관련 편성이 있으나 작성서식 적립금액은 없음(금액 비교 제외)`;
+  return '해당 없음(작성서식 적립금액 없음 · PDF 퇴직 관련 편성 없음)';
+}
+
+function buildPrecheck(report){
+  const rows=[]; const issues=[];
+  const salaryObj = report.excel?.salary; const ex = salaryObj?.summary;
+  const pdfItems = report.pdf?.items || [];
+  const totals = pdfItems.filter(x=>x.구분==='총액행'); const calcs = pdfItems.filter(x=>x.구분==='산출기초');
+  const totalByName = (name) => totalRowByName(totals, name)?.PDF금액 || 0;
+  const addIssue=(지적내용,근거)=>issues.push({번호:issues.length+1,지적내용,근거});
+  addBasisIssues(issues, calcs);
+  if(ex){
+    const teacherBase = ex.교원.소계본봉 || ex.교원.본봉;
+    const staffBase = ex.직원.소계본봉 || ex.직원.본봉;
+    const teacherPayCalcs = exactMokCalcs(calcs, '교원급여');
+    const teacherPayTotal = totalByName('교원급여') || sumAmount(teacherPayCalcs);
+    const teacherOff = findOffMokMatches(calcs, '교원급여', amountDiff(teacherBase, teacherPayTotal), '교원급여');
+    rows.push({구분:'급여', 항목:'교원급여', 엑셀금액:teacherBase, PDF금액:teacherPayTotal, 검토결과:detailVerdict('교원급여', teacherBase, teacherPayTotal, ex.교원.인원, sumPeopleDistinct(teacherPayCalcs)||'', teacherOff)});
+    const staffPayCalcs = exactMokCalcs(calcs, '직원급여');
+    const staffPayTotal = totalByName('직원급여') || sumAmount(staffPayCalcs);
+    const staffOff = findOffMokMatches(calcs, '직원급여', amountDiff(staffBase, staffPayTotal), '직원급여');
+    rows.push({구분:'급여', 항목:'직원급여', 엑셀금액:staffBase, PDF금액:staffPayTotal, 검토결과:detailVerdict('직원급여', staffBase, staffPayTotal, ex.직원.인원, sumPeopleDistinct(staffPayCalcs)||'', staffOff)});
+    const allowanceRows = ex.수당.filter(a=>!LEGAL_RE.test(a.항목));
+    const teacherAnalysis = analyzeAllowances('교원', allowanceRows, pdfItems, totalRowByName(totals, '교원수당'));
+    const staffAnalysis = analyzeAllowances('직원', allowanceRows, pdfItems, totalRowByName(totals, '직원수당'));
+    for(const d of teacherAnalysis.details) rows.push({구분:'수당', 항목:d.항목, 엑셀금액:d.엑셀금액, PDF금액:d.PDF금액, 검토결과:d.검토결과});
+    for(const d of staffAnalysis.details) rows.push({구분:'수당', 항목:d.항목, 엑셀금액:d.엑셀금액, PDF금액:d.PDF금액, 검토결과:d.검토결과});
+    addOffMokDiffIssues_v50(issues, calcs, [
+      {category:'교원급여', expectedMok:'교원급여', excelAmount:teacherBase, pdfAmount:teacherPayTotal},
+      {category:'직원급여', expectedMok:'직원급여', excelAmount:staffBase, pdfAmount:staffPayTotal},
+      {category:'교원수당', expectedMok:'교원수당', excelAmount:teacherAnalysis.totalExcel, pdfAmount:teacherAnalysis.groupMatchedAmount || teacherAnalysis.groupTotal},
+      {category:'직원수당', expectedMok:'직원수당', excelAmount:staffAnalysis.totalExcel, pdfAmount:staffAnalysis.groupMatchedAmount || staffAnalysis.groupTotal}
+    ]);
+    addMissingAllowanceIssues(issues, teacherAnalysis, staffAnalysis);
+  }
+  const excelRetireSummary = getExcelRetirementSummary(report.excel?.retirement || []);
+  const pdfRetireSummary = getPdfRetirementSummary(pdfItems);
+  rows.push({구분:'퇴직', 항목:'퇴직적립금', 엑셀금액:excelRetireSummary.amount, PDF금액:pdfRetireSummary.amount, 검토결과:retirementVerdict(excelRetireSummary, pdfRetireSummary)});
+  if(excelRetireSummary.has && !pdfRetireSummary.has) addIssue('퇴직적립금 미편성', '작성서식에는 적립금이월액 계 금액이 있으나 세출예산명세서에서 교원/직원 퇴직금및퇴직적립금 편성을 찾지 못했습니다. 금액 일치 여부는 검토하지 않습니다.');
+  if(excelRetireSummary.has && pdfRetireSummary.has){
+    if(excelRetireSummary.byKind?.교원>0 && !(pdfRetireSummary.byKind?.교원>0 || pdfRetireSummary.byKind?.공통>0)) addIssue('교원퇴직적립금 편성 확인 필요', '작성서식에서 교원 퇴직 적립금액이 확인되었으나 PDF에서 교원퇴직금및퇴직적립금 목이 명확히 확인되지 않았습니다.');
+    if(excelRetireSummary.byKind?.직원>0 && !(pdfRetireSummary.byKind?.직원>0 || pdfRetireSummary.byKind?.공통>0)) addIssue('직원퇴직적립금 편성 확인 필요', '작성서식에서 직원 퇴직 적립금액이 확인되었으나 PDF에서 직원퇴직금및퇴직적립금 목이 명확히 확인되지 않았습니다.');
+  }
+  if(!excelRetireSummary.has && pdfRetireSummary.has) addIssue('작성서식 적립금액 없음 / PDF 퇴직 관련 편성 확인', '작성서식의 적립금이월액 계 금액은 확인되지 않았으나 PDF에는 퇴직 관련 편성이 있습니다. 필요 시 원자료를 확인하세요.');
+  return {rows, issues, notices:[SOURCE_PDF_NOTICE]};
+}
+
+function addOffMokDiffIssues_v50(issues, calcs, checks){
+  const seen = new Set(issues.map(i=>i.지적내용+'|'+i.근거));
+  for(const c of checks){
+    const diff = amountDiff(c.excelAmount, c.pdfAmount);
+    if(closeMoney(diff,0)) continue;
+    const matches = findOffMokMatches(calcs, c.expectedMok, diff, c.category);
+    for(const x of matches){
+      const item = cleanItemName(x.항목 || c.category);
+      const detail = `${item} ${fmt(x.PDF금액)}을 ${c.expectedMok}이 아닌 ${x.목 || x.상위항목 || '다른 목'}에 편성`;
+      const basis = `${c.category} 차액 ${fmt(Math.abs(diff))}과 일치. PDF ${x.페이지 || ''}쪽 산출기초: ${x.산출기초 || ''}`;
+      const key = detail+'|'+basis; if(seen.has(key)) continue;
+      seen.add(key); issues.push({번호:issues.length+1, 지적내용:detail, 근거:basis});
+    }
+  }
+}
+
+function render(report){
+  if(report.excel){
+    const ex=report.excel;
+    $('excelSummary').innerHTML = `<span class="pill">파일 ${escapeHtml(ex.fileName)}</span><span class="pill">파서 ${escapeHtml(ex.parser||'-')}</span><span class="pill">보이는 시트 ${ex.visibleSheets?.length||0}개</span>` + (ex.sourcePdfNotice ? `<p class="muted">${escapeHtml(ex.sourcePdfNotice)}</p>` : '');
+    let html = '<h3 class="section-title">시트/표 후보</h3>'+table(['sheet','score','found','message'], ex.salaryCandidates||[], {small:true});
+    if(ex.salary?.ok){
+      html += `<h3 class="section-title">선택된 보수 표: ${escapeHtml(ex.salary.sheetName)}</h3>`;
+      html += table(['항목','값'], Object.entries(ex.salary.header||{}).map(([항목,값])=>({항목,값:JSON.stringify(값)})), {small:true});
+      html += '<h3 class="section-title">보수 요약</h3>'+table(['구분','본봉','소계본봉','지급액계','소계지급액계','인원'], [
+        {구분:'교원', 본봉:fmt(ex.salary.summary.교원.본봉), 소계본봉:fmt(ex.salary.summary.교원.소계본봉), 지급액계:fmt(ex.salary.summary.교원.지급액계), 소계지급액계:fmt(ex.salary.summary.교원.소계지급액계), 인원:ex.salary.summary.교원.인원},
+        {구분:'직원', 본봉:fmt(ex.salary.summary.직원.본봉), 소계본봉:fmt(ex.salary.summary.직원.소계본봉), 지급액계:fmt(ex.salary.summary.직원.지급액계), 소계지급액계:fmt(ex.salary.summary.직원.소계지급액계), 인원:ex.salary.summary.직원.인원}
+      ]);
+      html += '<h3 class="section-title">수당 추출</h3>'+table(['항목','교원금액','직원금액'], (ex.salary.summary.수당||[]).map(a=>({항목:a.항목, 교원금액:fmt(a.교원금액), 직원금액:fmt(a.직원금액)})));
+    }else html += '<p class="bad">보수 표를 구조적으로 읽지 못했습니다. 작성서식 PDF라면 스캔본 여부를 확인하고, 엑셀 원본 사용을 권장합니다.</p>';
+    html += '<h3 class="section-title">퇴직 관련 표</h3>'+table(['sheetName','positiveAmount','hasRetirementAmount','positiveCells'], (ex.retirement||[]).map(r=>({sheetName:r.sheetName, positiveAmount:fmt(r.positiveAmount), hasRetirementAmount:r.hasRetirementAmount?'있음':'없음', positiveCells:(r.positiveCells||[]).map(c=>`${c.행}행 ${c.열}열 ${fmt(c.값)}`).join(' / ')})));
+    if(ex.pdfLines) html += '<h3 class="section-title">작성서식 PDF 원문 라인</h3>'+table(['페이지','y','텍스트'], ex.pdfLines.slice(0,300), {small:true});
+    $('excelTables').innerHTML = html;
+  }
+  if(report.pdf){
+    const pdf=report.pdf;
+    $('pdfSummary').innerHTML = `<span class="pill">파일 ${escapeHtml(pdf.fileName)}</span><span class="pill">${pdf.pageCount}페이지</span><span class="pill">항목 ${pdf.items.length}개</span>`;
+    let html = '<h3 class="section-title">PDF 추출 항목</h3>'+table(['구분','페이지','목','항목','PDF금액','PDF금액천원','누락항목','산출기초'], pdf.items.map(x=>({...x,PDF금액:fmt(x.PDF금액),누락항목:(x.누락항목||[]).join(', ')})));
+    html += '<h3 class="section-title">PDF 원문 라인</h3>'+table(['페이지','y','텍스트'], pdf.lines.slice(0,300), {small:true});
+    $('pdfTables').innerHTML = html;
+  }
+  const review = report.precheck || {rows:[], issues:[]};
+  let reviewHtml = '<h3 class="section-title">금액 검토</h3>' + table(['구분','항목','엑셀금액','PDF금액','검토결과'], (review.rows||[]).map(r=>({구분:r.구분, 항목:r.항목, 엑셀금액:fmt(r.엑셀금액), PDF금액:fmt(r.PDF금액), 검토결과:r.검토결과})));
+  reviewHtml += '<h3 class="section-title">지적사항</h3>' + table(['번호','지적내용','근거'], review.issues || []);
+  $('precheck').innerHTML = reviewHtml;
+}
